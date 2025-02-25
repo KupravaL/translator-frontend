@@ -4,7 +4,7 @@ import { useAuth as useClerkAuth } from '@clerk/clerk-react';
 
 // ✅ Create axios instance
 const api = axios.create({
-  baseURL: '/api', // Adjust if your backend runs on a different host
+  baseURL: import.meta.env.VITE_API_URL || '/api', // Use environment variable if available
   headers: {
     'Content-Type': 'application/json',
   },
