@@ -147,5 +147,81 @@ export const balanceService = {
   }
 };
 
+// ✅ Document Translation Service
+export const documentService = {
+  translateDocument: async (file, fromLang, toLang) => {
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('from_lang', fromLang); // ✅ Ensure this matches the backend expectation
+      formData.append('to_lang', toLang);
+
+      const response = await api.post('/documents/translate', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      return response.data;
+    } catch (error) {
+      console.error('Translation request failed:', error);
+      throw error.response?.data?.error || 'Translation failed. Please try again.';
+    }
+  },
+
+  exportToPdf: async (text, fileName) => {
+    try {
+      const response = await api.post('/export/pdf', { text, fileName });
+      return response.data;
+    } catch (error) {
+      console.error('PDF export failed:', error);
+      throw error.response?.data?.error || 'Export to PDF failed.';
+    }
+  },
+
+  exportToDocx: async (text, fileName) => {
+    try {
+      const response = await api.post('/export/docx', { text, fileName });
+      return response.data;
+    } catch (error) {
+      console.error('DOCX export failed:', error);
+      throw error.response?.data?.error || 'Export to DOCX failed.';
+    }
+  },
+
+  exportToDriveAsPdf: async (content, fileName, options = {}) => {
+    try {
+      const response = await api.post('/export/pdf', {
+        text: content,
+        fileName,
+        saveToGoogleDrive: true,
+        createFolder: options.createFolder || false,
+        folderName: options.folderName || '',
+        folderId: options.folderId || null
+      });
+
+      return response.data;
+    } catch (error) {
+      console.error('Export to Google Drive as PDF failed:', error);
+      throw error;
+    }
+  },
+
+  exportToDriveAsDocx: async (content, fileName, options = {}) => {
+    try {
+      const response = await api.post('/export/docx', {
+        text: content,
+        fileName,
+        saveToGoogleDrive: true,
+        folderId: options.folderId || null,
+        createFolder: options.createFolder || false,
+        folderName: options.folderName || '',
+      });
+
+      return response.data;
+    } catch (error) {
+      console.error('Export to Google Drive as DOCX failed:', error);
+      throw error;
+    }
+  }
+};
+
 // Export the API instance
 export default api;
