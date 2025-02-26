@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import axios from 'axios';
 import { useAuth as useClerkAuth } from '@clerk/clerk-react';
 
-// ✅ Create axios instance
+// Create axios instance with better defaults
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '/api',
   headers: {
@@ -12,15 +12,15 @@ const api = axios.create({
   timeout: 30000, 
 });
 
-// Store the token for non-hook contexts
+// Store the token and interceptor ID for non-hook contexts
 let authToken = null;
 let requestInterceptorId = null;
 
 // Enhanced Clerk Authentication Hook
 export const useApiAuth = () => {
   const { getToken, isSignedIn } = useClerkAuth();
-  const [isInterceptorRegistered, setIsInterceptorRegistered] = useState(false);
-
+  // Remove useState - this isn't a component
+  
   const registerAuthInterceptor = async () => {
     try {
       // If an interceptor was already registered, remove it to prevent duplicates
@@ -48,7 +48,8 @@ export const useApiAuth = () => {
         return config;
       });
       
-      setIsInterceptorRegistered(true);
+      // Remove this line since we're not using state
+      // setIsInterceptorRegistered(true);
       console.log('✅ Auth interceptor registered successfully');
     } catch (error) {
       console.error("❌ Failed to register auth interceptor:", error);
@@ -69,8 +70,8 @@ export const useApiAuth = () => {
   }, [isSignedIn]); // Re-register when sign-in state changes
 
   return { 
-    registerAuthInterceptor,
-    isInterceptorRegistered 
+    registerAuthInterceptor
+    // Remove isInterceptorRegistered since we're not using state
   };
 };
 
