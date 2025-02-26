@@ -9,16 +9,17 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
   // Add timeout to prevent hanging requests
-  timeout: 60000, // Increased from 30000 to 60000 ms
+  timeout: 60000, // 60 seconds timeout
   // Enable credentials for CORS
   withCredentials: true,
 });
 
 // Store the token and interceptor ID for non-hook contexts
 let authToken = null;
+let tokenExpiryTime = null;
 let requestInterceptorId = null;
 
-// Enhanced Clerk Authentication Hook
+// Enhanced Clerk Authentication Hook with Token Refreshing
 export const useApiAuth = () => {
   const { getToken, isSignedIn } = useClerkAuth();
   
@@ -33,15 +34,27 @@ export const useApiAuth = () => {
       // Add a new interceptor with better token handling
       requestInterceptorId = api.interceptors.request.use(async (config) => {
         try {
-          // Always get a fresh token for each request
-          const token = await getToken();
-          authToken = token; // Store for potential use outside hooks
+          // Check if we need a new token (if it's expired or not set)
+          const now = Date.now();
+          const tokenIsValid = authToken && tokenExpiryTime && now < tokenExpiryTime;
           
-          if (token) {
-            config.headers.Authorization = `Bearer ${token}`;
-            console.log(`🔐 Request to ${config.url}: Token attached`);
-          } else {
-            console.warn(`⚠️ Request to ${config.url}: No auth token available`);
+          if (!tokenIsValid) {
+            // Get a fresh token with longer expiration
+            const token = await getToken({ expiration: 60 * 60 }); // 1 hour expiration
+            
+            if (token) {
+              // Store token and calculate expiry time (with 5 min buffer)
+              authToken = token;
+              tokenExpiryTime = now + (55 * 60 * 1000); // 55 minutes in ms
+              console.log(`🔄 Token refreshed, valid for next 55 minutes`);
+            } else {
+              console.warn(`⚠️ No auth token available`);
+            }
+          }
+          
+          // Add the token to the request if available
+          if (authToken) {
+            config.headers.Authorization = `Bearer ${authToken}`;
           }
         } catch (error) {
           console.error('❌ Failed to retrieve authentication token:', error);
@@ -50,23 +63,53 @@ export const useApiAuth = () => {
       });
       
       console.log('✅ Auth interceptor registered successfully');
+      
+      // Do an initial token fetch
+      try {
+        const token = await getToken({ expiration: 60 * 60 }); // 1 hour expiration
+        if (token) {
+          authToken = token;
+          tokenExpiryTime = Date.now() + (55 * 60 * 1000); // 55 minutes
+          console.log('✅ Initial token fetched successfully');
+        }
+      } catch (error) {
+        console.error('❌ Failed to fetch initial token:', error);
+      }
     } catch (error) {
       console.error("❌ Failed to register auth interceptor:", error);
     }
   };
-
-  // Register interceptor on mount and when auth state changes
+  
+  // Keep token refreshed in the background
   useEffect(() => {
-    registerAuthInterceptor();
-    
-    // Return cleanup function
-    return () => {
-      if (requestInterceptorId !== null) {
-        api.interceptors.request.eject(requestInterceptorId);
-        requestInterceptorId = null;
-      }
-    };
-  }, [isSignedIn]); // Re-register when sign-in state changes
+    if (isSignedIn) {
+      // Register the interceptor first
+      registerAuthInterceptor();
+      
+      // Set up a background refresh every 50 minutes
+      const refreshInterval = setInterval(async () => {
+        try {
+          const token = await getToken({ expiration: 60 * 60 }); // 1 hour
+          if (token) {
+            authToken = token;
+            tokenExpiryTime = Date.now() + (55 * 60 * 1000);
+            console.log('🔄 Background token refresh successful');
+          }
+        } catch (error) {
+          console.error('❌ Background token refresh failed:', error);
+        }
+      }, 50 * 60 * 1000); // 50 minutes
+      
+      // Clean up interval
+      return () => {
+        clearInterval(refreshInterval);
+        if (requestInterceptorId !== null) {
+          api.interceptors.request.eject(requestInterceptorId);
+          requestInterceptorId = null;
+        }
+      };
+    }
+  }, [isSignedIn]);
 
   return { 
     registerAuthInterceptor
@@ -152,21 +195,63 @@ export const balanceService = {
   }
 };
 
-// Enhanced Document Service with better error handling and status tracking
+// Document Service with Improved Authentication Handling and Request Deduplication
 export const documentService = {
+  // Store ongoing requests to prevent duplicates
+  _activeRequests: new Map(),
+  
+  // Helper function to handle authentication errors
+  _handleAuthError: async (error, endpoint, retryCallback) => {
+    if (error.response && error.response.status === 401) {
+      console.warn(`⚠️ Authentication error for ${endpoint}, refreshing token and retrying...`);
+      
+      // Refresh token
+      try {
+        // Clear existing token to force refresh
+        authToken = null;
+        tokenExpiryTime = null;
+        
+        // Wait a moment for token refresh
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // Retry the original request
+        return await retryCallback();
+      } catch (retryError) {
+        console.error(`❌ Retry after token refresh failed for ${endpoint}:`, retryError);
+        throw retryError;
+      }
+    }
+    throw error;
+  },
+  
   initiateTranslation: async (formData) => {
     const startTime = Date.now();
     console.log(`🔄 [${new Date().toISOString()}] Initiating document translation...`);
+    
     try {
       const response = await api.post('/documents/translate', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
+      
       const duration = Date.now() - startTime;
       console.log(`✅ [${new Date().toISOString()}] Translation initiated in ${duration}ms, received processId: ${response.data.processId}`);
       return response.data;
     } catch (error) {
       const duration = Date.now() - startTime;
       console.error(`❌ [${new Date().toISOString()}] Translation initiation failed after ${duration}ms:`, error);
+      
+      // Handle authentication errors
+      if (error.response && error.response.status === 401) {
+        try {
+          return await documentService._handleAuthError(
+            error, 
+            'translate', 
+            () => documentService.initiateTranslation(formData)
+          );
+        } catch (retryError) {
+          // If retry fails, continue with normal error handling
+        }
+      }
       
       // Enhanced error handling with specific error messages
       if (error.response) {
@@ -188,59 +273,128 @@ export const documentService = {
   },
   
   checkTranslationStatus: async (processId) => {
+    // Deduplicate concurrent status checks for the same processId
+    const requestKey = `status-${processId}`;
+    
+    // If there's already an active request for this processId, return its promise
+    if (documentService._activeRequests.has(requestKey)) {
+      console.log(`⏳ [${new Date().toISOString()}] Reusing existing status check for process: ${processId}`);
+      return documentService._activeRequests.get(requestKey);
+    }
+    
+    // Create a new request
     const startTime = Date.now();
     console.log(`🔄 [${new Date().toISOString()}] Checking translation status for process: ${processId}`);
-    try {
-      const response = await api.get(`/documents/status/${processId}`);
-      const duration = Date.now() - startTime;
-      console.log(`✅ [${new Date().toISOString()}] Status check completed in ${duration}ms - Status: ${response.data.status}, Progress: ${response.data.progress}%`);
-      return response.data;
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      console.error(`❌ [${new Date().toISOString()}] Status check failed after ${duration}ms:`, error);
-      
-      // Enhanced error handling with structured error information
-      const errorData = {
-        message: 'Failed to check translation status',
-        statusCode: error.response?.status || 500,
-        originalError: error.message,
-        shouldRetry: true
-      };
-      
-      if (error.code === 'ECONNABORTED') {
-        errorData.message = 'Request timed out. The server might be processing a large document.';
-      } else if (error.response?.status === 404) {
-        errorData.message = 'Translation process not found';
-        errorData.shouldRetry = false;
+    
+    // Create the promise for this request
+    const requestPromise = (async () => {
+      try {
+        const response = await api.get(`/documents/status/${processId}`);
+        const duration = Date.now() - startTime;
+        console.log(`✅ [${new Date().toISOString()}] Status check completed in ${duration}ms - Status: ${response.data.status}, Progress: ${response.data.progress}%`);
+        return response.data;
+      } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`❌ [${new Date().toISOString()}] Status check failed after ${duration}ms:`, error);
+        
+        // Handle authentication errors
+        if (error.response && error.response.status === 401) {
+          try {
+            return await documentService._handleAuthError(
+              error, 
+              'status', 
+              () => api.get(`/documents/status/${processId}`)
+            ).then(response => response.data);
+          } catch (retryError) {
+            // If retry fails, continue with normal error handling
+          }
+        }
+        
+        // Enhanced error handling
+        const errorData = {
+          message: 'Failed to check translation status',
+          statusCode: error.response?.status || 500,
+          originalError: error.message,
+          shouldRetry: true
+        };
+        
+        if (error.code === 'ECONNABORTED') {
+          errorData.message = 'Request timed out. The server might be processing a large document.';
+        } else if (error.response?.status === 404) {
+          errorData.message = 'Translation process not found';
+          errorData.shouldRetry = false;
+        }
+        
+        throw errorData;
+      } finally {
+        // Remove this request from the active requests map
+        documentService._activeRequests.delete(requestKey);
       }
-      
-      throw errorData;
-    }
+    })();
+    
+    // Store the promise in the active requests map
+    documentService._activeRequests.set(requestKey, requestPromise);
+    
+    return requestPromise;
   },
   
   getTranslationResult: async (processId) => {
+    // Deduplicate concurrent result fetches for the same processId
+    const requestKey = `result-${processId}`;
+    
+    // If there's already an active request for this processId, return its promise
+    if (documentService._activeRequests.has(requestKey)) {
+      console.log(`⏳ [${new Date().toISOString()}] Reusing existing result fetch for process: ${processId}`);
+      return documentService._activeRequests.get(requestKey);
+    }
+    
     const startTime = Date.now();
     console.log(`🔄 [${new Date().toISOString()}] Fetching translation result for process: ${processId}`);
-    try {
-      const response = await api.get(`/documents/result/${processId}`);
-      const duration = Date.now() - startTime;
-      console.log(`✅ [${new Date().toISOString()}] Translation result fetched successfully in ${duration}ms, content length: ${response.data.translatedText?.length || 0} chars`);
-      return response.data;
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      console.error(`❌ [${new Date().toISOString()}] Result fetch failed after ${duration}ms:`, error);
-      
-      // Enhanced error handling with specific error messages
-      if (error.response?.status === 404) {
-        throw new Error('Translation not found. The process may have expired.');
-      } else if (error.response?.status === 400) {
-        throw new Error('Translation is not yet complete. Please wait until it finishes processing.');
-      } else if (error.code === 'ECONNABORTED') {
-        throw new Error('Request timed out. The translation might be very large.');
+    
+    // Create the promise for this request
+    const requestPromise = (async () => {
+      try {
+        const response = await api.get(`/documents/result/${processId}`);
+        const duration = Date.now() - startTime;
+        console.log(`✅ [${new Date().toISOString()}] Translation result fetched successfully in ${duration}ms, content length: ${response.data.translatedText?.length || 0} chars`);
+        return response.data;
+      } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`❌ [${new Date().toISOString()}] Result fetch failed after ${duration}ms:`, error);
+        
+        // Handle authentication errors
+        if (error.response && error.response.status === 401) {
+          try {
+            return await documentService._handleAuthError(
+              error, 
+              'result', 
+              () => api.get(`/documents/result/${processId}`)
+            ).then(response => response.data);
+          } catch (retryError) {
+            // If retry fails, continue with normal error handling
+          }
+        }
+        
+        // Enhanced error handling with specific error messages
+        if (error.response?.status === 404) {
+          throw new Error('Translation not found. The process may have expired.');
+        } else if (error.response?.status === 400) {
+          throw new Error('Translation is not yet complete. Please wait until it finishes processing.');
+        } else if (error.code === 'ECONNABORTED') {
+          throw new Error('Request timed out. The translation might be very large.');
+        }
+        
+        throw new Error('Failed to fetch translation result. Please try again later.');
+      } finally {
+        // Remove this request from the active requests map
+        documentService._activeRequests.delete(requestKey);
       }
-      
-      throw new Error('Failed to fetch translation result. Please try again later.');
-    }
+    })();
+    
+    // Store the promise in the active requests map
+    documentService._activeRequests.set(requestKey, requestPromise);
+    
+    return requestPromise;
   },
 
   exportToPdf: async (text, fileName) => {
@@ -251,6 +405,20 @@ export const documentService = {
       return response.data;
     } catch (error) {
       console.error('❌ PDF export failed:', error);
+      
+      // Handle authentication errors
+      if (error.response && error.response.status === 401) {
+        try {
+          return await documentService._handleAuthError(
+            error, 
+            'exportPdf', 
+            () => api.post('/export/pdf', { text, fileName })
+          ).then(response => response.data);
+        } catch (retryError) {
+          // If retry fails, continue with normal error handling
+        }
+      }
+      
       throw error.response?.data?.error || 'Export to PDF failed.';
     }
   },
@@ -263,6 +431,20 @@ export const documentService = {
       return response.data;
     } catch (error) {
       console.error('❌ DOCX export failed:', error);
+      
+      // Handle authentication errors
+      if (error.response && error.response.status === 401) {
+        try {
+          return await documentService._handleAuthError(
+            error, 
+            'exportDocx', 
+            () => api.post('/export/docx', { text, fileName })
+          ).then(response => response.data);
+        } catch (retryError) {
+          // If retry fails, continue with normal error handling
+        }
+      }
+      
       throw error.response?.data?.error || 'Export to DOCX failed.';
     }
   },

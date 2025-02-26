@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Copy, Check, FileText, Download, Languages, Loader2, X } from 'lucide-react';
 import { useUser } from '@clerk/clerk-react';
 import { toast } from 'sonner';
@@ -14,7 +14,15 @@ export default function DocumentTranslationPage() {
   const { registerAuthInterceptor } = useApiAuth();
   const contentRef = useRef(null);
   const statusCheckTimeoutRef = useRef(null);
-
+  const pollAttemptRef = useRef(0);
+  const lastStatusRef = useRef(null);
+  const statusUpdateIntervalRef = useRef(null);
+  
+  // Keep track of consecutive failures
+  const [consecFailures, setConsecFailures] = useState(0);
+  // For UI updates showing time since last status update
+  const [timeCounter, setTimeCounter] = useState(0);
+  
   const [translationStatus, setTranslationStatus] = useState({
     isLoading: false,
     progress: 0,
@@ -25,12 +33,12 @@ export default function DocumentTranslationPage() {
     direction: 'ltr',
     processId: null,
     currentPage: 0,
-    totalPages: 0
+    totalPages: 0,
+    lastStatusUpdate: null
   });
 
   const [isCopied, setIsCopied] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState('en');
-  const [retryCount, setRetryCount] = useState(0);
 
   // Register auth interceptor on mount
   useEffect(() => {
@@ -43,91 +51,202 @@ export default function DocumentTranslationPage() {
       if (statusCheckTimeoutRef.current) {
         clearTimeout(statusCheckTimeoutRef.current);
       }
+      if (statusUpdateIntervalRef.current) {
+        clearInterval(statusUpdateIntervalRef.current);
+      }
     };
   }, []);
-
-  // Status polling with adaptive retry and backoff
+  
+  // Effect to update the time counter for UI display of "last updated X seconds ago"
   useEffect(() => {
-    const pollStatus = async () => {
-      // Only poll if we have a process ID and it's still loading
-      if (!translationStatus.processId || !translationStatus.isLoading) {
-        return;
+    // Clear any existing interval
+    if (statusUpdateIntervalRef.current) {
+      clearInterval(statusUpdateIntervalRef.current);
+    }
+    
+    // Only run the counter when translation is actively loading
+    if (translationStatus.isLoading && translationStatus.lastStatusUpdate) {
+      // Set initial value
+      setTimeCounter(Math.floor((Date.now() - translationStatus.lastStatusUpdate) / 1000));
+      
+      // Update every second
+      statusUpdateIntervalRef.current = setInterval(() => {
+        setTimeCounter(Math.floor((Date.now() - translationStatus.lastStatusUpdate) / 1000));
+      }, 1000);
+    }
+    
+    return () => {
+      if (statusUpdateIntervalRef.current) {
+        clearInterval(statusUpdateIntervalRef.current);
       }
+    };
+  }, [translationStatus.isLoading, translationStatus.lastStatusUpdate]);
 
-      try {
-        const statusData = await documentService.checkTranslationStatus(translationStatus.processId);
-        
-        // Reset retry count on successful status check
-        setRetryCount(0);
-        
-        // Update status in state
+  // Helper function to determine polling interval based on current state
+  const getPollInterval = useCallback(() => {
+    const { status, progress } = translationStatus;
+    const failures = consecFailures;
+    
+    // Base timing parameters
+    let baseInterval = 2000; // 2 seconds default
+    
+    // Adjust based on translation status
+    if (status === 'pending') {
+      baseInterval = 1500; // 1.5 seconds for pending
+    } else if (status === 'in_progress') {
+      // For in_progress, use more frequent polling during early stages
+      // and less frequent polling during later stages
+      if (progress < 25) {
+        baseInterval = 2000; // 2 seconds for early stages
+      } else if (progress < 75) {
+        baseInterval = 3000; // 3 seconds for middle stages
+      } else {
+        baseInterval = 4000; // 4 seconds for later stages
+      }
+    }
+    
+    // Add jitter to prevent synchronized requests
+    // This adds a random amount between -500ms and +500ms
+    const jitter = Math.floor(Math.random() * 1000) - 500;
+    
+    // Apply backoff for consecutive failures
+    // Using exponential backoff with a cap
+    const maxBackoff = 20000; // 20 seconds maximum
+    const failureBackoff = failures > 0 ? Math.min(Math.pow(1.5, failures) * 1000, maxBackoff) : 0;
+    
+    // Combine base interval, jitter, and backoff
+    const finalInterval = Math.max(1000, baseInterval + jitter + failureBackoff);
+    
+    console.log(`📊 Poll timing: base=${baseInterval}ms, jitter=${jitter}ms, backoff=${failureBackoff}ms, final=${finalInterval}ms`);
+    
+    return finalInterval;
+  }, [translationStatus, consecFailures]);
+
+  // Polling function with better error handling
+  const pollTranslationStatus = useCallback(async () => {
+    const { processId, isLoading } = translationStatus;
+    
+    // Only poll if we have a process ID and it's still loading
+    if (!processId || !isLoading) {
+      return;
+    }
+    
+    // Log which attempt this is
+    pollAttemptRef.current += 1;
+    console.log(`🔄 Polling attempt #${pollAttemptRef.current} for process: ${processId}`);
+    
+    try {
+      const statusData = await documentService.checkTranslationStatus(processId);
+      
+      // Reset consecutive failures on success
+      setConsecFailures(0);
+      
+      // Store latest status for comparison
+      lastStatusRef.current = {
+        status: statusData.status,
+        progress: statusData.progress,
+        currentPage: statusData.currentPage,
+        totalPages: statusData.totalPages,
+        timestamp: Date.now()
+      };
+      
+      // Update status in state
+      setTranslationStatus(prev => ({
+        ...prev,
+        progress: statusData.progress,
+        status: statusData.status,
+        currentPage: statusData.currentPage,
+        totalPages: statusData.totalPages,
+        lastStatusUpdate: Date.now()
+      }));
+      
+      // Check if translation completed or failed
+      if (statusData.status === 'completed') {
+        console.log('✅ Translation completed, fetching results');
+        fetchTranslationResults(processId);
+      } else if (statusData.status === 'failed') {
+        console.error('❌ Translation failed according to status');
         setTranslationStatus(prev => ({
           ...prev,
-          progress: statusData.progress,
-          status: statusData.status,
-          currentPage: statusData.currentPage,
-          totalPages: statusData.totalPages
+          isLoading: false,
+          error: 'Translation failed. Please try again.',
+          status: 'failed'
         }));
-        
-        // Check if translation completed or failed
-        if (statusData.status === 'completed') {
-          fetchTranslationResults(translationStatus.processId);
-        } else if (statusData.status === 'failed') {
-          setTranslationStatus(prev => ({
-            ...prev,
-            isLoading: false,
-            error: 'Translation failed. Please try again.',
-            status: 'failed'
-          }));
-          toast.error('Translation failed');
-        } else {
-          // Continue polling if still in progress
-          // Use adaptive polling interval (faster for pending, slower for in_progress)
-          const pollInterval = statusData.status === 'pending' ? 2000 : 3000;
-          statusCheckTimeoutRef.current = setTimeout(pollStatus, pollInterval);
-        }
-      } catch (error) {
-        console.error('Status check error:', error);
-        
-        // Increment retry count
-        const newRetryCount = retryCount + 1;
-        setRetryCount(newRetryCount);
-        
-        // Implement exponential backoff up to a maximum of 10 seconds
-        // Formula: min(maxDelay, baseDelay * 2^retryCount)
-        const baseDelay = 1000; // 1 second base
-        const maxDelay = 10000; // 10 seconds maximum
-        const delay = Math.min(maxDelay, baseDelay * Math.pow(1.5, newRetryCount));
-        
-        // If we've tried too many times (10+), stop polling and show an error
-        if (newRetryCount > 10) {
-          setTranslationStatus(prev => ({
-            ...prev,
-            isLoading: false,
-            error: 'Lost connection to the server. The translation may still be processing in the background.',
-            status: 'unknown'
-          }));
-          toast.error('Lost connection to the server');
-        } else {
-          // Log retry attempt with backoff delay
-          console.log(`Retrying status check in ${Math.round(delay / 1000)} seconds (attempt ${newRetryCount})...`);
-          statusCheckTimeoutRef.current = setTimeout(pollStatus, delay);
-        }
+        toast.error('Translation failed');
+      } else {
+        // Continue polling if still in progress
+        const pollInterval = getPollInterval();
+        console.log(`🔄 Scheduling next poll in ${pollInterval}ms`);
+        statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, pollInterval);
       }
-    };
-
-    // Start polling if processId exists and is loading
-    if (translationStatus.processId && translationStatus.isLoading) {
-      // Initial delay before first poll
-      statusCheckTimeoutRef.current = setTimeout(pollStatus, 1000);
+    } catch (error) {
+      console.error('🚨 Status check error:', error);
+      
+      // Increase consecutive failures
+      setConsecFailures(prev => prev + 1);
+      
+      // Check if we should give up (more than 15 consecutive failures)
+      if (consecFailures >= 15) {
+        console.error('🚨 Too many consecutive failures, giving up');
+        setTranslationStatus(prev => ({
+          ...prev,
+          isLoading: false,
+          error: 'Lost connection to the server. The translation may still be processing in the background.',
+          status: 'unknown'
+        }));
+        toast.error('Lost connection to the server');
+        return;
+      }
+      
+      // Continue polling after a delay
+      const pollInterval = getPollInterval();
+      console.log(`🔄 Scheduling retry poll in ${pollInterval}ms after error`);
+      statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, pollInterval);
     }
+  }, [translationStatus, consecFailures, getPollInterval]);
 
-    return () => {
-      if (statusCheckTimeoutRef.current) {
-        clearTimeout(statusCheckTimeoutRef.current);
+  // Effect to start polling whenever processId changes
+  useEffect(() => {
+    if (translationStatus.processId && translationStatus.isLoading) {
+      // Reset polling attempt counter
+      pollAttemptRef.current = 0;
+      
+      // Start polling with small initial delay
+      statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 500);
+      
+      return () => {
+        if (statusCheckTimeoutRef.current) {
+          clearTimeout(statusCheckTimeoutRef.current);
+        }
+      };
+    }
+  }, [translationStatus.processId, translationStatus.isLoading, pollTranslationStatus]);
+  
+  // Effect to detect stuck translations
+  useEffect(() => {
+    if (!translationStatus.isLoading || !translationStatus.lastStatusUpdate) {
+      return;
+    }
+    
+    // Check if we've gone too long without a status update
+    const checkStuckInterval = setInterval(() => {
+      const now = Date.now();
+      const timeSinceLastUpdate = now - translationStatus.lastStatusUpdate;
+      
+      // If we haven't had a status update in 2 minutes, consider it stuck
+      if (timeSinceLastUpdate > 2 * 60 * 1000) {
+        console.warn(`⚠️ Translation might be stuck - no updates for ${Math.floor(timeSinceLastUpdate/1000)}s`);
+        
+        // If polling is also stuck, restart it
+        if (statusCheckTimeoutRef.current) {
+          clearTimeout(statusCheckTimeoutRef.current);
+          statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 1000);
+        }
       }
-    };
-  }, [translationStatus.processId, translationStatus.isLoading, retryCount]);
+    }, 30000); // Check every 30 seconds
+    
+    return () => clearInterval(checkStuckInterval);
+  }, [translationStatus.isLoading, translationStatus.lastStatusUpdate, pollTranslationStatus]);
 
   const onTranslate = async (file, fromLang, toLang) => {
     if (!file) {
@@ -156,8 +275,12 @@ export default function DocumentTranslationPage() {
       direction: toLang === 'fa' || toLang === 'ar' ? 'rtl' : 'ltr',
       processId: null,
       currentPage: 0,
-      totalPages: 0
+      totalPages: 0,
+      lastStatusUpdate: Date.now()
     });
+    
+    // Reset consecutive failures
+    setConsecFailures(0);
   
     try {
       // Initiate translation process
@@ -172,17 +295,17 @@ export default function DocumentTranslationPage() {
         throw new Error('No process ID received from the server');
       }
       
-      // Reset retry count
-      setRetryCount(0);
-      
       // Update state with process ID
       setTranslationStatus(prev => ({
         ...prev,
         processId: response.processId,
-        status: response.status || 'pending'
+        status: response.status || 'pending',
+        lastStatusUpdate: Date.now()
       }));
       
       toast.success('Translation started successfully');
+      
+      // Polling will start automatically via the useEffect
       
     } catch (error) {
       console.error('Translation initiation error:', error);
@@ -211,7 +334,8 @@ export default function DocumentTranslationPage() {
         direction: resultResponse.direction,
         processId: processId,
         currentPage: resultResponse.metadata.currentPage || 0,
-        totalPages: resultResponse.metadata.totalPages || 0
+        totalPages: resultResponse.metadata.totalPages || 0,
+        lastStatusUpdate: Date.now()
       });
       
       toast.success('Translation completed!');
@@ -225,12 +349,29 @@ export default function DocumentTranslationPage() {
         // Reset status to in_progress and continue polling
         setTranslationStatus(prev => ({
           ...prev,
-          status: 'in_progress'
+          status: 'in_progress',
+          lastStatusUpdate: Date.now()
         }));
         
         // Resume polling after a short delay
-        statusCheckTimeoutRef.current = setTimeout(() => {
-          setRetryCount(0); // Reset retry count
+        statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 2000);
+      } else if (error.response && error.response.status === 401) {
+        // Authentication error - retry after a moment
+        console.log('Authentication error when fetching results, retrying shortly...');
+        
+        setTimeout(async () => {
+          try {
+            await fetchTranslationResults(processId);
+          } catch (retryError) {
+            console.error('Failed to fetch results on retry:', retryError);
+            setTranslationStatus(prev => ({
+              ...prev,
+              isLoading: false,
+              status: 'failed',
+              error: 'Authentication error when fetching results. Please try again.',
+            }));
+            toast.error('Authentication error');
+          }
         }, 2000);
       } else {
         // Otherwise, show the error
@@ -260,6 +401,27 @@ export default function DocumentTranslationPage() {
     }));
     
     toast.info('Translation cancelled');
+  };
+  
+  // Function to manually retry polling
+  const handleRetryPolling = () => {
+    if (!translationStatus.processId) return;
+    
+    console.log('🔄 Manually retrying polling...');
+    setConsecFailures(0);
+    
+    setTranslationStatus(prev => ({
+      ...prev,
+      isLoading: true,
+      error: null,
+      status: prev.status === 'failed' || prev.status === 'unknown' ? 'in_progress' : prev.status,
+      lastStatusUpdate: Date.now()
+    }));
+    
+    // Start polling immediately
+    pollTranslationStatus();
+    
+    toast.info('Retrying translation status check...');
   };
 
   const handleCopyText = async () => {
@@ -294,6 +456,17 @@ export default function DocumentTranslationPage() {
       return 'Translation cancelled';
     }
     return 'Preparing translation...';
+  };
+  
+  // Helper function to format the "last updated" time
+  const formatTimeAgo = (seconds) => {
+    if (seconds < 60) {
+      return `${seconds}s ago`;
+    } else if (seconds < 3600) {
+      return `${Math.floor(seconds / 60)}m ${seconds % 60}s ago`;
+    } else {
+      return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
+    }
   };
 
   if (!isLoaded) {
@@ -356,6 +529,11 @@ export default function DocumentTranslationPage() {
                   <div className="flex items-center">
                     <Loader2 className="h-4 w-4 mr-2 animate-spin text-indigo-600" />
                     <span>{getStatusMessage()}</span>
+                    {consecFailures > 0 && (
+                      <span className="ml-2 text-xs text-amber-600">
+                        {consecFailures > 5 ? 'Connection issues...' : 'Retrying...'}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-3">
                     <span className="font-medium">{Math.round(translationStatus.progress)}%</span>
@@ -376,9 +554,16 @@ export default function DocumentTranslationPage() {
                 </div>
                 <div className="mt-2 flex flex-wrap items-center justify-between text-xs text-indigo-700">
                   <p className="italic">This may take a few minutes depending on document size</p>
-                  {translationStatus.totalPages > 0 && (
-                    <p>Page {translationStatus.currentPage} of {translationStatus.totalPages}</p>
-                  )}
+                  <div className="flex items-center gap-4">
+                    {translationStatus.totalPages > 0 && (
+                      <p>Page {translationStatus.currentPage} of {translationStatus.totalPages}</p>
+                    )}
+                    {translationStatus.lastStatusUpdate && (
+                      <p className="text-xs text-gray-500">
+                        Last update: {formatTimeAgo(timeCounter)}
+                      </p>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
@@ -392,9 +577,17 @@ export default function DocumentTranslationPage() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
                   </div>
-                  <div className="ml-3">
+                  <div className="ml-3 flex-1">
                     <h3 className="text-sm font-medium">Translation failed</h3>
                     <p className="mt-1 text-sm">{translationStatus.error}</p>
+                    {translationStatus.processId && (
+                      <button 
+                        onClick={handleRetryPolling}
+                        className="mt-2 inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded-md text-white bg-red-600 hover:bg-red-700"
+                      >
+                        Retry status check
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
