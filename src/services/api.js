@@ -154,22 +154,41 @@ export const balanceService = {
 
 // Document Service with better logging
 export const documentService = {
-  translateDocument: async (file, fromLang, toLang) => {
-    console.log(`🔄 Translating document from ${fromLang} to ${toLang}...`);
+  initiateTranslation: async (formData) => {
+    console.log(`🔄 Initiating document translation...`);
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('from_lang', fromLang);
-      formData.append('to_lang', toLang);
-
       const response = await api.post('/documents/translate', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      console.log('✅ Document translated successfully');
+      console.log('✅ Translation process initiated');
       return response.data;
     } catch (error) {
-      console.error('❌ Translation request failed:', error);
-      throw error.response?.data?.error || 'Translation failed. Please try again.';
+      console.error('❌ Translation initiation failed:', error);
+      throw error;
+    }
+  },
+  
+  checkTranslationStatus: async (processId) => {
+    console.log(`🔄 Checking translation status for process: ${processId}`);
+    try {
+      const response = await api.get(`/documents/status/${processId}`);
+      console.log(`✅ Status check: ${response.data.status}, Progress: ${response.data.progress}%`);
+      return response.data;
+    } catch (error) {
+      console.error('❌ Status check failed:', error);
+      throw error;
+    }
+  },
+  
+  getTranslationResult: async (processId) => {
+    console.log(`🔄 Fetching translation result for process: ${processId}`);
+    try {
+      const response = await api.get(`/documents/result/${processId}`);
+      console.log('✅ Translation result fetched successfully');
+      return response.data;
+    } catch (error) {
+      console.error('❌ Result fetch failed:', error);
+      throw error;
     }
   },
 

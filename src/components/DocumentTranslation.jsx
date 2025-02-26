@@ -46,17 +46,17 @@ export default function DocumentTranslationPage() {
       toast.error('Please upload a file before translating.');
       return;
     }
-
+  
     if (!fromLang || !toLang) {
       toast.error('Please select both source and target languages.');
       return;
     }
-
+  
     if (translationStatus.isLoading) {
       toast.error('A translation is already in progress.');
       return;
     }
-
+  
     setSelectedLanguage(toLang);
     setTranslationStatus({
       isLoading: true,
@@ -65,50 +65,124 @@ export default function DocumentTranslationPage() {
       translatedText: null,
       fileName: file.name,
       direction: toLang === 'fa' || toLang === 'ar' ? 'rtl' : 'ltr',
+      processId: null
     });
-
-    const controller = new AbortController();
-    setAbortController(controller);
-
+  
     try {
-      // Simulate progress updates
-      const progressInterval = setInterval(() => {
-        setTranslationStatus((prev) => ({
-          ...prev,
-          progress: Math.min(prev.progress + 5, 90),
-        }));
-      }, 1000);
-
-      const result = await documentService.translateDocument(file, fromLang, toLang);
-
-      clearInterval(progressInterval);
-
-      if (!result.translatedText) {
-        throw new Error('No translated text received from the server');
+      // Initiate translation process
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('from_lang', fromLang);
+      formData.append('to_lang', toLang);
+  
+      const response = await documentService.initiateTranslation(formData);
+      
+      if (!response.processId) {
+        throw new Error('No process ID received from the server');
       }
-
+      
+      // Update state with process ID
+      setTranslationStatus(prev => ({
+        ...prev,
+        processId: response.processId
+      }));
+      
+      // Start polling for status
+      startPollingStatus(response.processId);
+      
+    } catch (error) {
+      console.error('Translation initiation error:', error);
+      setTranslationStatus(prev => ({
+        ...prev,
+        isLoading: false,
+        error: error.response?.data?.error || 'Failed to start translation process',
+      }));
+      toast.error('Failed to start translation');
+    }
+  };
+  
+  // Polling function
+  const startPollingStatus = (processId) => {
+    const statusInterval = setInterval(async () => {
+      try {
+        const statusResponse = await documentService.checkTranslationStatus(processId);
+        
+        // Update progress
+        setTranslationStatus(prev => ({
+          ...prev,
+          progress: statusResponse.progress,
+        }));
+        
+        // Check if completed or failed
+        if (statusResponse.status === 'completed') {
+          clearInterval(statusInterval);
+          // Fetch the results
+          fetchTranslationResults(processId);
+        } else if (statusResponse.status === 'failed') {
+          clearInterval(statusInterval);
+          setTranslationStatus(prev => ({
+            ...prev,
+            isLoading: false,
+            error: 'Translation failed',
+          }));
+          toast.error('Translation failed');
+        }
+        
+      } catch (error) {
+        console.error('Status check error:', error);
+        clearInterval(statusInterval);
+        setTranslationStatus(prev => ({
+          ...prev,
+          isLoading: false,
+          error: 'Failed to check translation status',
+        }));
+        toast.error('Failed to check translation status');
+      }
+    }, 2000); // Poll every 2 seconds
+    
+    // Store interval ID for cleanup
+    setAbortController(statusInterval);
+  };
+  
+  // Fetch results function
+  const fetchTranslationResults = async (processId) => {
+    try {
+      const resultResponse = await documentService.getTranslationResult(processId);
+      
       setTranslationStatus({
         isLoading: false,
         progress: 100,
         error: null,
-        translatedText: result.translatedText,
-        fileName: file.name,
-        direction: result.direction || 'ltr',
+        translatedText: resultResponse.translatedText,
+        fileName: resultResponse.metadata.originalFileName,
+        direction: resultResponse.direction,
+        processId: processId
       });
-
-      toast.success(`Translation completed!`);
+      
+      toast.success('Translation completed!');
+      
     } catch (error) {
-      console.error('Translation error:', error);
-      setTranslationStatus((prev) => ({
+      console.error('Result fetch error:', error);
+      setTranslationStatus(prev => ({
         ...prev,
         isLoading: false,
-        error:
-          error.name === 'AbortError'
-            ? 'Translation timed out. Please try again with a smaller document or contact support.'
-            : error.response?.data?.error || 'An unexpected error occurred during translation',
+        error: 'Failed to fetch translation results',
       }));
-    } finally {
+      toast.error('Failed to fetch translation results');
+    }
+  };
+  
+  // Cancel function
+  const handleCancel = () => {
+    if (typeof abortController === 'number') {
+      clearInterval(abortController);
       setAbortController(null);
+      setTranslationStatus(prev => ({
+        ...prev,
+        isLoading: false,
+        error: 'Translation cancelled',
+      }));
+      toast.info('Translation cancelled');
     }
   };
 
@@ -124,19 +198,6 @@ export default function DocumentTranslationPage() {
     } catch (err) {
       console.error('Failed to copy text:', err);
       toast.error('Failed to copy text to clipboard');
-    }
-  };
-
-  const handleCancel = () => {
-    if (abortController) {
-      abortController.abort();
-      setAbortController(null);
-      setTranslationStatus((prev) => ({
-        ...prev,
-        isLoading: false,
-        error: 'Translation cancelled',
-      }));
-      toast.info('Translation cancelled');
     }
   };
 
