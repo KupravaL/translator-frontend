@@ -2,14 +2,16 @@ import { useEffect } from 'react';
 import axios from 'axios';
 import { useAuth as useClerkAuth } from '@clerk/clerk-react';
 
-// Create axios instance with better defaults
+// Create axios instance with proper configuration
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '/api',
   headers: {
     'Content-Type': 'application/json',
   },
   // Add timeout to prevent hanging requests
-  timeout: 30000, 
+  timeout: 30000,
+  // Enable credentials for CORS
+  withCredentials: true,
 });
 
 // Store the token and interceptor ID for non-hook contexts
@@ -19,7 +21,6 @@ let requestInterceptorId = null;
 // Enhanced Clerk Authentication Hook
 export const useApiAuth = () => {
   const { getToken, isSignedIn } = useClerkAuth();
-  // Remove useState - this isn't a component
   
   const registerAuthInterceptor = async () => {
     try {
@@ -48,8 +49,6 @@ export const useApiAuth = () => {
         return config;
       });
       
-      // Remove this line since we're not using state
-      // setIsInterceptorRegistered(true);
       console.log('✅ Auth interceptor registered successfully');
     } catch (error) {
       console.error("❌ Failed to register auth interceptor:", error);
@@ -71,20 +70,22 @@ export const useApiAuth = () => {
 
   return { 
     registerAuthInterceptor
-    // Remove isInterceptorRegistered since we're not using state
   };
 };
 
-// Enhanced Balance Service
+// Enhanced Balance Service with better error handling
 export const balanceService = {
   getBalance: async () => {
     try {
+      console.log("🔄 Fetching user balance...");
+      
       // First try the authenticated endpoint
       try {
         const response = await api.get('/balance/me/balance');
+        console.log("✅ Balance fetched successfully:", response.data);
         return response.data;
       } catch (error) {
-        // If authentication fails, try the debug endpoint
+        // If we get an authentication error, try the debug endpoint
         if (error.response && (error.response.status === 401 || error.response.status === 403)) {
           console.warn('⚠️ Authentication failed, trying debug endpoint');
           
@@ -92,7 +93,7 @@ export const balanceService = {
           const debugResponse = await api.get('/balance/debug/balance');
           console.log('Debug balance response:', debugResponse.data);
           
-          // If debug endpoint successfully got the user, return that data
+          // If debug endpoint successfully authenticated, return that data
           if (debugResponse.data.authenticated && debugResponse.data.userId !== 'anonymous') {
             return {
               userId: debugResponse.data.userId,
@@ -123,10 +124,11 @@ export const balanceService = {
     }
   },
 
-  // Rest of the balance service remains unchanged
   addPages: async (pages) => {
+    console.log(`🔄 Adding ${pages} pages to balance...`);
     try {
       const response = await api.post('/balance/add-pages', { pages });
+      console.log('✅ Pages added successfully:', response.data);
       return response.data;
     } catch (error) {
       console.error('❌ Failed to add pages:', error);
@@ -135,11 +137,13 @@ export const balanceService = {
   },
   
   purchasePages: async (pages, email) => {
+    console.log(`🔄 Creating payment for ${pages} pages...`);
     try {
       const response = await api.post('/balance/purchase/pages', { 
         pages, 
         email 
       });
+      console.log('✅ Payment created successfully:', response.data);
       return response.data;
     } catch (error) {
       console.error('❌ Failed to create payment:', error);
@@ -148,46 +152,53 @@ export const balanceService = {
   }
 };
 
-// ✅ Document Translation Service
+// Document Service with better logging
 export const documentService = {
   translateDocument: async (file, fromLang, toLang) => {
+    console.log(`🔄 Translating document from ${fromLang} to ${toLang}...`);
     try {
       const formData = new FormData();
       formData.append('file', file);
-      formData.append('from_lang', fromLang); // ✅ Ensure this matches the backend expectation
+      formData.append('from_lang', fromLang);
       formData.append('to_lang', toLang);
 
       const response = await api.post('/documents/translate', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
+      console.log('✅ Document translated successfully');
       return response.data;
     } catch (error) {
-      console.error('Translation request failed:', error);
+      console.error('❌ Translation request failed:', error);
       throw error.response?.data?.error || 'Translation failed. Please try again.';
     }
   },
 
   exportToPdf: async (text, fileName) => {
+    console.log(`🔄 Exporting document to PDF: ${fileName}...`);
     try {
       const response = await api.post('/export/pdf', { text, fileName });
+      console.log('✅ PDF exported successfully');
       return response.data;
     } catch (error) {
-      console.error('PDF export failed:', error);
+      console.error('❌ PDF export failed:', error);
       throw error.response?.data?.error || 'Export to PDF failed.';
     }
   },
 
   exportToDocx: async (text, fileName) => {
+    console.log(`🔄 Exporting document to DOCX: ${fileName}...`);
     try {
       const response = await api.post('/export/docx', { text, fileName });
+      console.log('✅ DOCX exported successfully');
       return response.data;
     } catch (error) {
-      console.error('DOCX export failed:', error);
+      console.error('❌ DOCX export failed:', error);
       throw error.response?.data?.error || 'Export to DOCX failed.';
     }
   },
 
   exportToDriveAsPdf: async (content, fileName, options = {}) => {
+    console.log(`🔄 Exporting to Google Drive as PDF: ${fileName}...`);
     try {
       const response = await api.post('/export/pdf', {
         text: content,
@@ -197,15 +208,16 @@ export const documentService = {
         folderName: options.folderName || '',
         folderId: options.folderId || null
       });
-
+      console.log('✅ PDF exported to Drive successfully');
       return response.data;
     } catch (error) {
-      console.error('Export to Google Drive as PDF failed:', error);
+      console.error('❌ Export to Google Drive as PDF failed:', error);
       throw error;
     }
   },
-
+  
   exportToDriveAsDocx: async (content, fileName, options = {}) => {
+    console.log(`🔄 Exporting to Google Drive as DOCX: ${fileName}...`);
     try {
       const response = await api.post('/export/docx', {
         text: content,
@@ -215,10 +227,10 @@ export const documentService = {
         createFolder: options.createFolder || false,
         folderName: options.folderName || '',
       });
-
+      console.log('✅ DOCX exported to Drive successfully');
       return response.data;
     } catch (error) {
-      console.error('Export to Google Drive as DOCX failed:', error);
+      console.error('❌ Export to Google Drive as DOCX failed:', error);
       throw error;
     }
   }
