@@ -9,7 +9,7 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
   // Add timeout to prevent hanging requests
-  timeout: 30000,
+  timeout: 60000, // Increased from 30000 to 60000 ms
   // Enable credentials for CORS
   withCredentials: true,
 });
@@ -155,39 +155,51 @@ export const balanceService = {
 // Document Service with better logging
 export const documentService = {
   initiateTranslation: async (formData) => {
-    console.log(`🔄 Initiating document translation...`);
+    const startTime = Date.now();
+    console.log(`🔄 [${new Date().toISOString()}] Initiating document translation...`);
     try {
       const response = await api.post('/documents/translate', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      console.log('✅ Translation process initiated');
+      const duration = Date.now() - startTime;
+      console.log(`✅ [${new Date().toISOString()}] Translation initiated in ${duration}ms, received processId: ${response.data.processId}`);
       return response.data;
     } catch (error) {
-      console.error('❌ Translation initiation failed:', error);
+      const duration = Date.now() - startTime;
+      console.error(`❌ [${new Date().toISOString()}] Translation initiation failed after ${duration}ms:`, error);
       throw error;
     }
   },
   
   checkTranslationStatus: async (processId) => {
-    console.log(`🔄 Checking translation status for process: ${processId}`);
+    const startTime = Date.now();
+    console.log(`🔄 [${new Date().toISOString()}] Checking translation status for process: ${processId}`);
     try {
       const response = await api.get(`/documents/status/${processId}`);
-      console.log(`✅ Status check: ${response.data.status}, Progress: ${response.data.progress}%`);
+      const duration = Date.now() - startTime;
+      console.log(`✅ [${new Date().toISOString()}] Status check completed in ${duration}ms - Status: ${response.data.status}, Progress: ${response.data.progress}%`);
       return response.data;
     } catch (error) {
-      console.error('❌ Status check failed:', error);
+      const duration = Date.now() - startTime;
+      console.error(`❌ [${new Date().toISOString()}] Status check failed after ${duration}ms:`, error);
+      if (error.code === 'ECONNABORTED') {
+        console.error('Request timed out. The server might be processing a large document.');
+      }
       throw error;
     }
   },
   
   getTranslationResult: async (processId) => {
-    console.log(`🔄 Fetching translation result for process: ${processId}`);
+    const startTime = Date.now();
+    console.log(`🔄 [${new Date().toISOString()}] Fetching translation result for process: ${processId}`);
     try {
       const response = await api.get(`/documents/result/${processId}`);
-      console.log('✅ Translation result fetched successfully');
+      const duration = Date.now() - startTime;
+      console.log(`✅ [${new Date().toISOString()}] Translation result fetched successfully in ${duration}ms, content length: ${response.data.translatedText?.length || 0} chars`);
       return response.data;
     } catch (error) {
-      console.error('❌ Result fetch failed:', error);
+      const duration = Date.now() - startTime;
+      console.error(`❌ [${new Date().toISOString()}] Result fetch failed after ${duration}ms:`, error);
       throw error;
     }
   },

@@ -101,52 +101,77 @@ export default function DocumentTranslationPage() {
     }
   };
   
-  // Polling function
+  // Polling function with retry mechanism
   const startPollingStatus = (processId) => {
     // Clear any existing interval first
     if (pollingInterval) {
       clearInterval(pollingInterval);
     }
 
-    const intervalId = setInterval(async () => {
-      try {
-        const statusResponse = await documentService.checkTranslationStatus(processId);
-        
-        // Update progress
-        setTranslationStatus(prev => ({
-          ...prev,
-          progress: statusResponse.progress,
-        }));
-        
-        // Check if completed or failed
-        if (statusResponse.status === 'completed') {
-          clearInterval(intervalId);
-          setPollingInterval(null);
-          // Fetch the results
-          fetchTranslationResults(processId);
-        } else if (statusResponse.status === 'failed') {
-          clearInterval(intervalId);
-          setPollingInterval(null);
+    const statusCheckWithRetry = async () => {
+      const maxRetries = 3;
+      let retryCount = 0;
+      let success = false;
+
+      while (retryCount < maxRetries && !success) {
+        try {
+          console.log(`Checking status (attempt ${retryCount + 1}/${maxRetries})...`);
+          const statusResponse = await documentService.checkTranslationStatus(processId);
+          
+          // Update progress
           setTranslationStatus(prev => ({
             ...prev,
-            isLoading: false,
-            error: 'Translation failed',
+            progress: statusResponse.progress,
           }));
-          toast.error('Translation failed');
+          
+          // Check if completed or failed
+          if (statusResponse.status === 'completed') {
+            clearInterval(intervalId);
+            setPollingInterval(null);
+            // Fetch the results
+            fetchTranslationResults(processId);
+            return;
+          } else if (statusResponse.status === 'failed') {
+            clearInterval(intervalId);
+            setPollingInterval(null);
+            setTranslationStatus(prev => ({
+              ...prev,
+              isLoading: false,
+              error: 'Translation failed',
+            }));
+            toast.error('Translation failed');
+            return;
+          }
+          
+          success = true;
+        } catch (error) {
+          retryCount++;
+          console.error(`Status check error (attempt ${retryCount}/${maxRetries}):`, error);
+          
+          if (retryCount === maxRetries) {
+            clearInterval(intervalId);
+            setPollingInterval(null);
+            setTranslationStatus(prev => ({
+              ...prev,
+              isLoading: false,
+              error: 'Failed to check translation status after multiple attempts',
+            }));
+            toast.error('Failed to check translation status');
+          } else {
+            // Log retry
+            console.log(`Retrying status check in 2 seconds...`);
+            // Wait 2 seconds before retry
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
         }
-        
-      } catch (error) {
-        console.error('Status check error:', error);
-        clearInterval(intervalId);
-        setPollingInterval(null);
-        setTranslationStatus(prev => ({
-          ...prev,
-          isLoading: false,
-          error: 'Failed to check translation status',
-        }));
-        toast.error('Failed to check translation status');
       }
-    }, 2000); // Poll every 2 seconds
+    };
+
+    // Initial status check immediately
+    statusCheckWithRetry();
+
+    // Then set up interval for subsequent checks
+    const intervalId = setInterval(statusCheckWithRetry, 5000); // Poll every 5 seconds instead of 2
     
     // Store interval ID for cleanup
     setPollingInterval(intervalId);
@@ -155,7 +180,13 @@ export default function DocumentTranslationPage() {
   // Fetch results function
   const fetchTranslationResults = async (processId) => {
     try {
+      const startTime = Date.now();
+      console.log(`[${new Date().toISOString()}] Fetching results for process ID: ${processId}`);
+      
       const resultResponse = await documentService.getTranslationResult(processId);
+      
+      const duration = Date.now() - startTime;
+      console.log(`[${new Date().toISOString()}] Results fetched successfully in ${duration}ms, content length: ${resultResponse.translatedText?.length || 0} chars`);
       
       setTranslationStatus({
         isLoading: false,
