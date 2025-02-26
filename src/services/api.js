@@ -152,7 +152,7 @@ export const balanceService = {
   }
 };
 
-// Document Service with better logging
+// Enhanced Document Service with better error handling and status tracking
 export const documentService = {
   initiateTranslation: async (formData) => {
     const startTime = Date.now();
@@ -167,7 +167,23 @@ export const documentService = {
     } catch (error) {
       const duration = Date.now() - startTime;
       console.error(`❌ [${new Date().toISOString()}] Translation initiation failed after ${duration}ms:`, error);
-      throw error;
+      
+      // Enhanced error handling with specific error messages
+      if (error.response) {
+        if (error.response.status === 413) {
+          throw new Error('File is too large. Maximum size is 20MB.');
+        }
+        
+        if (error.response.data && error.response.data.error) {
+          throw new Error(error.response.data.error);
+        }
+      }
+      
+      if (error.code === 'ECONNABORTED') {
+        throw new Error('Request timed out. Please try again with a smaller file.');
+      }
+      
+      throw new Error('Failed to initiate translation. Please try again later.');
     }
   },
   
@@ -182,10 +198,23 @@ export const documentService = {
     } catch (error) {
       const duration = Date.now() - startTime;
       console.error(`❌ [${new Date().toISOString()}] Status check failed after ${duration}ms:`, error);
+      
+      // Enhanced error handling with structured error information
+      const errorData = {
+        message: 'Failed to check translation status',
+        statusCode: error.response?.status || 500,
+        originalError: error.message,
+        shouldRetry: true
+      };
+      
       if (error.code === 'ECONNABORTED') {
-        console.error('Request timed out. The server might be processing a large document.');
+        errorData.message = 'Request timed out. The server might be processing a large document.';
+      } else if (error.response?.status === 404) {
+        errorData.message = 'Translation process not found';
+        errorData.shouldRetry = false;
       }
-      throw error;
+      
+      throw errorData;
     }
   },
   
@@ -200,7 +229,17 @@ export const documentService = {
     } catch (error) {
       const duration = Date.now() - startTime;
       console.error(`❌ [${new Date().toISOString()}] Result fetch failed after ${duration}ms:`, error);
-      throw error;
+      
+      // Enhanced error handling with specific error messages
+      if (error.response?.status === 404) {
+        throw new Error('Translation not found. The process may have expired.');
+      } else if (error.response?.status === 400) {
+        throw new Error('Translation is not yet complete. Please wait until it finishes processing.');
+      } else if (error.code === 'ECONNABORTED') {
+        throw new Error('Request timed out. The translation might be very large.');
+      }
+      
+      throw new Error('Failed to fetch translation result. Please try again later.');
     }
   },
 
