@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Copy, Check, FileText, Download, Languages, Loader2, X } from 'lucide-react';
+import { Copy, Check, FileText, Download, Languages, Loader2, X, RefreshCw } from 'lucide-react';
 import { useUser } from '@clerk/clerk-react';
 import { toast } from 'sonner';
 import { useApiAuth } from '../services/api';
@@ -17,11 +17,23 @@ export default function DocumentTranslationPage() {
   const pollAttemptRef = useRef(0);
   const lastStatusRef = useRef(null);
   const statusUpdateIntervalRef = useRef(null);
+  const forcedProgressRef = useRef(null);
   
-  // Keep track of consecutive failures
+  // Keep track of status check issues
   const [consecFailures, setConsecFailures] = useState(0);
+  const [lastFallbackStatus, setLastFallbackStatus] = useState(false);
+  const [statusCheckStalled, setStatusCheckStalled] = useState(false);
+  
   // For UI updates showing time since last status update
   const [timeCounter, setTimeCounter] = useState(0);
+  
+  // Add simulated progress for stalled status checks
+  const [simulatedProgress, setSimulatedProgress] = useState({
+    active: false,
+    value: 0,
+    page: 0,
+    total: 0
+  });
   
   const [translationStatus, setTranslationStatus] = useState({
     isLoading: false,
@@ -54,6 +66,9 @@ export default function DocumentTranslationPage() {
       if (statusUpdateIntervalRef.current) {
         clearInterval(statusUpdateIntervalRef.current);
       }
+      if (forcedProgressRef.current) {
+        clearInterval(forcedProgressRef.current);
+      }
     };
   }, []);
   
@@ -71,8 +86,33 @@ export default function DocumentTranslationPage() {
       
       // Update every second
       statusUpdateIntervalRef.current = setInterval(() => {
-        setTimeCounter(Math.floor((Date.now() - translationStatus.lastStatusUpdate) / 1000));
+        const secondsElapsed = Math.floor((Date.now() - translationStatus.lastStatusUpdate) / 1000);
+        setTimeCounter(secondsElapsed);
+        
+        // If we've gone too long without a status update, flag it as stalled
+        if (secondsElapsed > 30) {
+          setStatusCheckStalled(true);
+          
+          // Start simulated progress if actual progress is stuck at 0
+          if (translationStatus.progress === 0 && !simulatedProgress.active) {
+            startSimulatedProgress();
+          }
+        }
       }, 1000);
+    } else {
+      setStatusCheckStalled(false);
+      // Stop simulated progress when translation stops loading
+      setSimulatedProgress({
+        active: false,
+        value: 0,
+        page: 0,
+        total: 0
+      });
+      
+      if (forcedProgressRef.current) {
+        clearInterval(forcedProgressRef.current);
+        forcedProgressRef.current = null;
+      }
     }
     
     return () => {
@@ -80,28 +120,80 @@ export default function DocumentTranslationPage() {
         clearInterval(statusUpdateIntervalRef.current);
       }
     };
-  }, [translationStatus.isLoading, translationStatus.lastStatusUpdate]);
+  }, [translationStatus.isLoading, translationStatus.lastStatusUpdate, translationStatus.progress]);
+
+  // Function to simulate progress when status check is stalled
+  const startSimulatedProgress = useCallback(() => {
+    if (forcedProgressRef.current) {
+      clearInterval(forcedProgressRef.current);
+    }
+    
+    // Start with small progress value
+    setSimulatedProgress({
+      active: true,
+      value: 5,
+      page: 1,
+      // Estimate total pages based on file type or default to 5
+      total: translationStatus.fileName?.toLowerCase().endsWith('.pdf') ? 5 : 1
+    });
+    
+    // Slowly increase progress to show that something is happening
+    forcedProgressRef.current = setInterval(() => {
+      setSimulatedProgress(prev => {
+        // Don't go beyond 90% with simulated progress
+        if (prev.value >= 90) {
+          return prev;
+        }
+        
+        // Calculate next page if needed
+        let nextPage = prev.page;
+        if (prev.value > prev.page * (100 / prev.total)) {
+          nextPage = Math.min(prev.page + 1, prev.total);
+        }
+        
+        return {
+          ...prev,
+          value: Math.min(prev.value + 1, 90),
+          page: nextPage
+        };
+      });
+    }, 3000); // Increase every 3 seconds
+    
+    return () => {
+      if (forcedProgressRef.current) {
+        clearInterval(forcedProgressRef.current);
+        forcedProgressRef.current = null;
+      }
+    };
+  }, [translationStatus.fileName]);
 
   // Helper function to determine polling interval based on current state
   const getPollInterval = useCallback(() => {
     const { status, progress } = translationStatus;
     const failures = consecFailures;
+    const isStalled = statusCheckStalled;
     
     // Base timing parameters
     let baseInterval = 2000; // 2 seconds default
     
-    // Adjust based on translation status
-    if (status === 'pending') {
-      baseInterval = 1500; // 1.5 seconds for pending
-    } else if (status === 'in_progress') {
-      // For in_progress, use more frequent polling during early stages
-      // and less frequent polling during later stages
-      if (progress < 25) {
-        baseInterval = 2000; // 2 seconds for early stages
-      } else if (progress < 75) {
-        baseInterval = 3000; // 3 seconds for middle stages
-      } else {
-        baseInterval = 4000; // 4 seconds for later stages
+    // If status checks are stalled, adjust polling strategy
+    if (isStalled) {
+      // More aggressive polling when stalled
+      baseInterval = 1500;
+    } else {
+      // Adjust based on translation status
+      if (status === 'pending') {
+        baseInterval = 1500; // 1.5 seconds for pending
+      } else if (status === 'in_progress') {
+        // For in_progress, use more frequent polling during early stages
+        // and less frequent polling during later stages
+        if (progress < 25) {
+          baseInterval = 2000; // 2 seconds for early stages
+        } else if (progress < 75) {
+          baseInterval = 3000; // 3 seconds for middle stages
+        } else {
+          baseInterval = 4000; // 4 seconds for later stages
+        }
       }
     }
     
@@ -111,7 +203,7 @@ export default function DocumentTranslationPage() {
     
     // Apply backoff for consecutive failures
     // Using exponential backoff with a cap
-    const maxBackoff = 20000; // 20 seconds maximum
+    const maxBackoff = 15000; // 15 seconds maximum
     const failureBackoff = failures > 0 ? Math.min(Math.pow(1.5, failures) * 1000, maxBackoff) : 0;
     
     // Combine base interval, jitter, and backoff
@@ -120,9 +212,9 @@ export default function DocumentTranslationPage() {
     console.log(`📊 Poll timing: base=${baseInterval}ms, jitter=${jitter}ms, backoff=${failureBackoff}ms, final=${finalInterval}ms`);
     
     return finalInterval;
-  }, [translationStatus, consecFailures]);
+  }, [translationStatus, consecFailures, statusCheckStalled]);
 
-  // Polling function with better error handling
+  // Polling function with better error handling and support for stalled status
   const pollTranslationStatus = useCallback(async () => {
     const { processId, isLoading } = translationStatus;
     
@@ -138,8 +230,43 @@ export default function DocumentTranslationPage() {
     try {
       const statusData = await documentService.checkTranslationStatus(processId);
       
-      // Reset consecutive failures on success
-      setConsecFailures(0);
+      // Check if this is a fallback status (not a real server response)
+      const isFallback = statusData.isFallback === true;
+      setLastFallbackStatus(isFallback);
+      
+      if (isFallback) {
+        console.log(`⚠️ Using fallback status information as the server response is stalled`);
+        
+        // Don't reset consecutive failures for fallback responses
+        // But don't increment them either, we're managing to get some information
+        
+        // If we've been using fallback statuses for too long, we should show a message
+        if (timeCounter > 60) { // After a minute of fallbacks
+          toast.warning("The server is taking longer than expected. The translation is still in progress.", {
+            id: "stalled-status",
+            duration: 10000
+          });
+        }
+      } else {
+        // Only reset consecutive failures on real success
+        setConsecFailures(0);
+        setStatusCheckStalled(false);
+        
+        // Stop simulated progress if we get a real status update
+        if (simulatedProgress.active) {
+          setSimulatedProgress({
+            active: false,
+            value: 0,
+            page: 0,
+            total: 0
+          });
+          
+          if (forcedProgressRef.current) {
+            clearInterval(forcedProgressRef.current);
+            forcedProgressRef.current = null;
+          }
+        }
+      }
       
       // Store latest status for comparison
       lastStatusRef.current = {
@@ -203,7 +330,7 @@ export default function DocumentTranslationPage() {
       console.log(`🔄 Scheduling retry poll in ${pollInterval}ms after error`);
       statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, pollInterval);
     }
-  }, [translationStatus, consecFailures, getPollInterval]);
+  }, [translationStatus, consecFailures, getPollInterval, simulatedProgress.active, timeCounter]);
 
   // Effect to start polling whenever processId changes
   useEffect(() => {
@@ -222,7 +349,7 @@ export default function DocumentTranslationPage() {
     }
   }, [translationStatus.processId, translationStatus.isLoading, pollTranslationStatus]);
   
-  // Effect to detect stuck translations
+  // Effect to detect completely stuck translations
   useEffect(() => {
     if (!translationStatus.isLoading || !translationStatus.lastStatusUpdate) {
       return;
@@ -233,17 +360,23 @@ export default function DocumentTranslationPage() {
       const now = Date.now();
       const timeSinceLastUpdate = now - translationStatus.lastStatusUpdate;
       
-      // If we haven't had a status update in 2 minutes, consider it stuck
-      if (timeSinceLastUpdate > 2 * 60 * 1000) {
-        console.warn(`⚠️ Translation might be stuck - no updates for ${Math.floor(timeSinceLastUpdate/1000)}s`);
+      // If we haven't had a status update in 3 minutes, consider it stuck
+      if (timeSinceLastUpdate > 3 * 60 * 1000) {
+        console.warn(`⚠️ Translation might be completely stuck - no updates for ${Math.floor(timeSinceLastUpdate/1000)}s`);
         
         // If polling is also stuck, restart it
         if (statusCheckTimeoutRef.current) {
           clearTimeout(statusCheckTimeoutRef.current);
           statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 1000);
         }
+        
+        // Notify user after 3 minutes of no updates
+        toast.warning("The translation has been running for a while without updates. You can cancel and try again if needed.", {
+          id: "translation-stuck",
+          duration: 10000
+        });
       }
-    }, 30000); // Check every 30 seconds
+    }, 60000); // Check every minute
     
     return () => clearInterval(checkStuckInterval);
   }, [translationStatus.isLoading, translationStatus.lastStatusUpdate, pollTranslationStatus]);
@@ -279,8 +412,16 @@ export default function DocumentTranslationPage() {
       lastStatusUpdate: Date.now()
     });
     
-    // Reset consecutive failures
+    // Reset status tracking
     setConsecFailures(0);
+    setLastFallbackStatus(false);
+    setStatusCheckStalled(false);
+    setSimulatedProgress({
+      active: false,
+      value: 0,
+      page: 0,
+      total: 0
+    });
   
     try {
       // Initiate translation process
@@ -338,6 +479,21 @@ export default function DocumentTranslationPage() {
         lastStatusUpdate: Date.now()
       });
       
+      // Stop simulated progress
+      if (simulatedProgress.active) {
+        setSimulatedProgress({
+          active: false,
+          value: 0,
+          page: 0,
+          total: 0
+        });
+        
+        if (forcedProgressRef.current) {
+          clearInterval(forcedProgressRef.current);
+          forcedProgressRef.current = null;
+        }
+      }
+      
       toast.success('Translation completed!');
       
     } catch (error) {
@@ -393,12 +549,24 @@ export default function DocumentTranslationPage() {
       statusCheckTimeoutRef.current = null;
     }
     
+    if (forcedProgressRef.current) {
+      clearInterval(forcedProgressRef.current);
+      forcedProgressRef.current = null;
+    }
+    
     setTranslationStatus(prev => ({
       ...prev,
       isLoading: false,
       status: 'cancelled',
       error: 'Translation cancelled by user',
     }));
+    
+    setSimulatedProgress({
+      active: false,
+      value: 0,
+      page: 0,
+      total: 0
+    });
     
     toast.info('Translation cancelled');
   };
@@ -409,6 +577,7 @@ export default function DocumentTranslationPage() {
     
     console.log('🔄 Manually retrying polling...');
     setConsecFailures(0);
+    setStatusCheckStalled(false);
     
     setTranslationStatus(prev => ({
       ...prev,
@@ -441,10 +610,16 @@ export default function DocumentTranslationPage() {
 
   // Generate status message based on current state
   const getStatusMessage = () => {
+    if (statusCheckStalled) {
+      return 'Processing translation (status updates delayed)...';
+    }
+    
     if (translationStatus.status === 'pending') {
       return 'Initializing translation...';
     } else if (translationStatus.status === 'in_progress') {
-      if (translationStatus.totalPages > 0) {
+      if (simulatedProgress.active) {
+        return `Translating page ${simulatedProgress.page} of ${simulatedProgress.total} (estimated)`;
+      } else if (translationStatus.totalPages > 0) {
         return `Translating page ${translationStatus.currentPage} of ${translationStatus.totalPages}`;
       }
       return 'Processing translation...';
@@ -467,6 +642,32 @@ export default function DocumentTranslationPage() {
     } else {
       return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m ago`;
     }
+  };
+  
+  // Get the current progress percentage to display
+  const getProgressPercentage = () => {
+    if (simulatedProgress.active) {
+      return simulatedProgress.value;
+    }
+    return translationStatus.progress;
+  };
+  
+  // Get current page info to display
+  const getCurrentPageInfo = () => {
+    if (simulatedProgress.active && simulatedProgress.total > 0) {
+      return {
+        current: simulatedProgress.page,
+        total: simulatedProgress.total,
+        isEstimated: true
+      };
+    } else if (translationStatus.totalPages > 0) {
+      return {
+        current: translationStatus.currentPage,
+        total: translationStatus.totalPages,
+        isEstimated: false
+      };
+    }
+    return null;
   };
 
   if (!isLoaded) {
@@ -534,9 +735,19 @@ export default function DocumentTranslationPage() {
                         {consecFailures > 5 ? 'Connection issues...' : 'Retrying...'}
                       </span>
                     )}
+                    {statusCheckStalled && (
+                      <span className="ml-2 text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">
+                        Status delayed
+                      </span>
+                    )}
+                    {simulatedProgress.active && (
+                      <span className="ml-2 text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">
+                        Estimated
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-3">
-                    <span className="font-medium">{Math.round(translationStatus.progress)}%</span>
+                    <span className="font-medium">{Math.round(getProgressPercentage())}%</span>
                     <button 
                       onClick={handleCancel} 
                       className="p-1 rounded-full hover:bg-gray-200 text-gray-600 transition-colors"
@@ -548,20 +759,36 @@ export default function DocumentTranslationPage() {
                 </div>
                 <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
                   <div 
-                    className="h-full bg-indigo-600 transition-all duration-300 ease-out"
-                    style={{ width: `${translationStatus.progress}%` }}
+                    className={`h-full transition-all duration-300 ease-out ${
+                      simulatedProgress.active ? 'bg-blue-400' : 'bg-indigo-600'
+                    }`}
+                    style={{ width: `${getProgressPercentage()}%` }}
                   />
                 </div>
                 <div className="mt-2 flex flex-wrap items-center justify-between text-xs text-indigo-700">
                   <p className="italic">This may take a few minutes depending on document size</p>
                   <div className="flex items-center gap-4">
-                    {translationStatus.totalPages > 0 && (
-                      <p>Page {translationStatus.currentPage} of {translationStatus.totalPages}</p>
+                    {getCurrentPageInfo() && (
+                      <p>
+                        Page {getCurrentPageInfo().current} of {getCurrentPageInfo().total}
+                        {getCurrentPageInfo().isEstimated && " (est.)"}
+                      </p>
                     )}
                     {translationStatus.lastStatusUpdate && (
-                      <p className="text-xs text-gray-500">
-                        Last update: {formatTimeAgo(timeCounter)}
-                      </p>
+                      <div className="flex items-center">
+                        <p className={`text-xs ${timeCounter > 60 ? 'text-amber-600' : 'text-gray-500'}`}>
+                          Last update: {formatTimeAgo(timeCounter)}
+                        </p>
+                        {timeCounter > 60 && (
+                          <button
+                            onClick={handleRetryPolling}
+                            className="ml-2 p-1 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-700"
+                            title="Force refresh status"
+                          >
+                            <RefreshCw size={12} />
+                          </button>
+                        )}
+                      </div>
                     )}
                   </div>
                 </div>
@@ -569,123 +796,123 @@ export default function DocumentTranslationPage() {
             )}
 
             {/* Error Message */}
-            {!translationStatus.isLoading && translationStatus.error && (
-              <div className="mt-6 bg-red-50 p-4 rounded-lg border border-red-100">
-                <div className="flex items-start text-red-800">
-                  <div className="shrink-0 mt-0.5">
-                    <svg className="h-5 w-5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                  </div>
-                  <div className="ml-3 flex-1">
-                    <h3 className="text-sm font-medium">Translation failed</h3>
-                    <p className="mt-1 text-sm">{translationStatus.error}</p>
-                    {translationStatus.processId && (
-                      <button 
-                        onClick={handleRetryPolling}
-                        className="mt-2 inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded-md text-white bg-red-600 hover:bg-red-700"
-                      >
-                        Retry status check
-                      </button>
-                    )}
-                  </div>
+          {!translationStatus.isLoading && translationStatus.error && (
+            <div className="mt-6 bg-red-50 p-4 rounded-lg border border-red-100">
+              <div className="flex items-start text-red-800">
+                <div className="shrink-0 mt-0.5">
+                  <svg className="h-5 w-5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
                 </div>
-              </div>
-            )}
-            
-            {/* Translation Results */}
-            {translationStatus.translatedText && (
-              <div className="mt-8 border-t pt-6">
-                <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
-                  <h2 className="text-xl font-semibold text-gray-800 flex items-center">
-                    <FileText className="h-5 w-5 mr-2 text-indigo-600" /> 
-                    Translated Document
-                  </h2>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={handleCopyText}
-                      className="flex items-center gap-2 px-3 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 transition-colors"
-                      disabled={!translationStatus.translatedText}
+                <div className="ml-3 flex-1">
+                  <h3 className="text-sm font-medium">Translation failed</h3>
+                  <p className="mt-1 text-sm">{translationStatus.error}</p>
+                  {translationStatus.processId && (
+                    <button 
+                      onClick={handleRetryPolling}
+                      className="mt-2 inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded-md text-white bg-red-600 hover:bg-red-700"
                     >
-                      {isCopied ? <Check size={16} /> : <Copy size={16} />}
-                      {isCopied ? "Copied" : "Copy Text"}
+                      Retry status check
                     </button>
-                    <DocumentDownloadButton
-                      text={translationStatus.translatedText}
-                      language={selectedLanguage}
-                      onError={(error) => toast.error(error)}
-                      onSuccess={() => toast.success('Document downloaded successfully!')}
-                      disabled={!translationStatus.translatedText || translationStatus.isLoading}
-                      className="flex items-center gap-2"
-                    />
-                    <GoogleDriveButton
-                      htmlContent={translationStatus.translatedText}
-                      fileName={translationStatus.fileName ? `translated_${translationStatus.fileName.replace(/\.(pdf|jpe?g|png|webp|heic)$/i, '.docx')}` : 'translated_document.docx'}
-                      onError={(error) => toast.error(error)}
-                      onSuccess={() => toast.success('Document saved to Google Drive successfully!')}
-                      disabled={!translationStatus.translatedText || translationStatus.isLoading}
-                      className="flex items-center gap-2"
-                    />
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Translation Results */}
+          {translationStatus.translatedText && (
+            <div className="mt-8 border-t pt-6">
+              <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
+                <h2 className="text-xl font-semibold text-gray-800 flex items-center">
+                  <FileText className="h-5 w-5 mr-2 text-indigo-600" /> 
+                  Translated Document
+                </h2>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleCopyText}
+                    className="flex items-center gap-2 px-3 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 transition-colors"
+                    disabled={!translationStatus.translatedText}
+                  >
+                    {isCopied ? <Check size={16} /> : <Copy size={16} />}
+                    {isCopied ? "Copied" : "Copy Text"}
+                  </button>
+                  <DocumentDownloadButton
+                    text={translationStatus.translatedText}
+                    language={selectedLanguage}
+                    onError={(error) => toast.error(error)}
+                    onSuccess={() => toast.success('Document downloaded successfully!')}
+                    disabled={!translationStatus.translatedText || translationStatus.isLoading}
+                    className="flex items-center gap-2"
+                  />
+                  <GoogleDriveButton
+                    htmlContent={translationStatus.translatedText}
+                    fileName={translationStatus.fileName ? `translated_${translationStatus.fileName.replace(/\.(pdf|jpe?g|png|webp|heic)$/i, '.docx')}` : 'translated_document.docx'}
+                    onError={(error) => toast.error(error)}
+                    onSuccess={() => toast.success('Document saved to Google Drive successfully!')}
+                    disabled={!translationStatus.translatedText || translationStatus.isLoading}
+                    className="flex items-center gap-2"
+                  />
+                </div>
+              </div>
+
+              <div className="mb-2 flex items-center">
+                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                  <Check className="w-3 h-3 mr-1" />
+                  Translated
+                </span>
+              </div>
+
+              <div
+                ref={contentRef}
+                className="document-preview p-6 border rounded-lg bg-white"
+                style={{
+                  direction: translationStatus.direction,
+                  textAlign: translationStatus.direction === 'rtl' ? 'right' : 'left',
+                  fontFamily: translationStatus.direction === 'rtl' ? 'Tahoma, Arial' : 'inherit',
+                }}
+                dangerouslySetInnerHTML={{ __html: translationStatus.translatedText }}
+              />
+              
+              <div className="mt-2 text-xs text-gray-500 text-right flex items-center justify-end gap-2">
+                <FileText className="h-3 w-3" />
+                Original file: {translationStatus.fileName}
+              </div>
+            </div>
+          )}
+                    </div>
+                  </div>
+                  
+                  {/* Features Section */}
+                  <div className="mt-12 mb-8">
+                    <h2 className="text-2xl font-bold text-center mb-8 text-gray-800">Features</h2>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                      <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
+                        <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
+                          <FileText className="h-6 w-6 text-indigo-600" />
+                        </div>
+                        <h3 className="text-lg font-semibold mb-2">Preserve Formatting</h3>
+                        <p className="text-gray-600">Maintain original document layout, tables, and styles in the translated output.</p>
+                      </div>
+                      
+                      <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
+                        <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
+                          <Languages className="h-6 w-6 text-indigo-600" />
+                        </div>
+                        <h3 className="text-lg font-semibold mb-2">Multiple Languages</h3>
+                        <p className="text-gray-600">Support for 13+ languages including Spanish, French, German, Chinese, and Arabic.</p>
+                      </div>
+                      
+                      <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
+                        <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
+                          <Download className="h-6 w-6 text-indigo-600" />
+                        </div>
+                        <h3 className="text-lg font-semibold mb-2">Export Options</h3>
+                        <p className="text-gray-600">Download translated documents in PDF or DOCX format for easy sharing.</p>
+                      </div>
+                    </div>
                   </div>
                 </div>
-
-                <div className="mb-2 flex items-center">
-                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                    <Check className="w-3 h-3 mr-1" />
-                    Translated
-                  </span>
-                </div>
-
-                <div
-                  ref={contentRef}
-                  className="document-preview p-6 border rounded-lg bg-white"
-                  style={{
-                    direction: translationStatus.direction,
-                    textAlign: translationStatus.direction === 'rtl' ? 'right' : 'left',
-                    fontFamily: translationStatus.direction === 'rtl' ? 'Tahoma, Arial' : 'inherit',
-                  }}
-                  dangerouslySetInnerHTML={{ __html: translationStatus.translatedText }}
-                />
-                
-                <div className="mt-2 text-xs text-gray-500 text-right flex items-center justify-end gap-2">
-                  <FileText className="h-3 w-3" />
-                  Original file: {translationStatus.fileName}
-                </div>
               </div>
-            )}
-          </div>
-        </div>
-        
-        {/* Features Section */}
-        <div className="mt-12 mb-8">
-          <h2 className="text-2xl font-bold text-center mb-8 text-gray-800">Features</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
-              <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
-                <FileText className="h-6 w-6 text-indigo-600" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">Preserve Formatting</h3>
-              <p className="text-gray-600">Maintain original document layout, tables, and styles in the translated output.</p>
-            </div>
-            
-            <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
-              <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
-                <Languages className="h-6 w-6 text-indigo-600" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">Multiple Languages</h3>
-              <p className="text-gray-600">Support for 13+ languages including Spanish, French, German, Chinese, and Arabic.</p>
-            </div>
-            
-            <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
-              <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
-                <Download className="h-6 w-6 text-indigo-600" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">Export Options</h3>
-              <p className="text-gray-600">Download translated documents in PDF or DOCX format for easy sharing.</p>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
+            );
+          }

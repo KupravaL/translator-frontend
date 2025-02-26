@@ -195,10 +195,13 @@ export const balanceService = {
   }
 };
 
-// Document Service with Improved Authentication Handling and Request Deduplication
+// Document Service with Improved Authentication Handling, Request Deduplication, and Timeout Handling
 export const documentService = {
   // Store ongoing requests to prevent duplicates
   _activeRequests: new Map(),
+  
+  // Store processId -> status mapping to provide fallback information
+  _lastKnownStatus: new Map(),
   
   // Helper function to handle authentication errors
   _handleAuthError: async (error, endpoint, retryCallback) => {
@@ -223,6 +226,39 @@ export const documentService = {
     }
     throw error;
   },
+
+  // Method to create a fallback status based on last known state for a process ID
+  _createFallbackStatus: (processId) => {
+    const lastStatus = documentService._lastKnownStatus.get(processId);
+    
+    if (lastStatus) {
+      // Include a timestamp to indicate this is a fallback status
+      return {
+        ...lastStatus,
+        isFallback: true,
+        timestamp: Date.now()
+      };
+    }
+    
+    // Default fallback if we have no previous status
+    return {
+      processId: processId,
+      status: 'pending',
+      progress: 0,
+      currentPage: 0,
+      totalPages: 0,
+      isFallback: true,
+      timestamp: Date.now()
+    };
+  },
+  
+  // Method to update the last known status for a process ID
+  _updateLastKnownStatus: (processId, statusData) => {
+    documentService._lastKnownStatus.set(processId, {
+      ...statusData,
+      timestamp: Date.now()
+    });
+  },
   
   initiateTranslation: async (formData) => {
     const startTime = Date.now();
@@ -235,6 +271,18 @@ export const documentService = {
       
       const duration = Date.now() - startTime;
       console.log(`✅ [${new Date().toISOString()}] Translation initiated in ${duration}ms, received processId: ${response.data.processId}`);
+      
+      // Initialize last known status
+      if (response.data.processId) {
+        documentService._updateLastKnownStatus(response.data.processId, {
+          processId: response.data.processId,
+          status: response.data.status || 'pending',
+          progress: 0,
+          currentPage: 0,
+          totalPages: 0
+        });
+      }
+      
       return response.data;
     } catch (error) {
       const duration = Date.now() - startTime;
@@ -282,6 +330,10 @@ export const documentService = {
       return documentService._activeRequests.get(requestKey);
     }
     
+    // Create an AbortController to handle timeouts
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8-second timeout
+    
     // Create a new request
     const startTime = Date.now();
     console.log(`🔄 [${new Date().toISOString()}] Checking translation status for process: ${processId}`);
@@ -289,13 +341,40 @@ export const documentService = {
     // Create the promise for this request
     const requestPromise = (async () => {
       try {
-        const response = await api.get(`/documents/status/${processId}`);
+        const response = await api.get(`/documents/status/${processId}`, {
+          signal: controller.signal,
+          timeout: 8000 // Also set axios timeout
+        });
+        
+        // Clear the timeout since the request completed
+        clearTimeout(timeoutId);
+        
         const duration = Date.now() - startTime;
         console.log(`✅ [${new Date().toISOString()}] Status check completed in ${duration}ms - Status: ${response.data.status}, Progress: ${response.data.progress}%`);
+        
+        // Update the last known status
+        documentService._updateLastKnownStatus(processId, response.data);
+        
         return response.data;
       } catch (error) {
+        // Clear the timeout
+        clearTimeout(timeoutId);
+        
         const duration = Date.now() - startTime;
-        console.error(`❌ [${new Date().toISOString()}] Status check failed after ${duration}ms:`, error);
+        
+        // Handle timeout cases - both AbortController timeout and axios timeout
+        if (
+          error.name === 'AbortError' || 
+          error.code === 'ECONNABORTED' || 
+          error.message.includes('timeout') ||
+          // Also treat 'pending' responses from Render.com as timeouts
+          (error.response && error.response.status === 503)
+        ) {
+          console.log(`⏳ [${new Date().toISOString()}] Status check timed out or pending after ${duration}ms - providing fallback status`);
+          
+          // Return a fallback status from our cache or a default pending state
+          return documentService._createFallbackStatus(processId);
+        }
         
         // Handle authentication errors
         if (error.response && error.response.status === 401) {
@@ -304,26 +383,42 @@ export const documentService = {
               error, 
               'status', 
               () => api.get(`/documents/status/${processId}`)
-            ).then(response => response.data);
+            ).then(response => {
+              documentService._updateLastKnownStatus(processId, response.data);
+              return response.data;
+            });
           } catch (retryError) {
-            // If retry fails, continue with normal error handling
+            // If auth retry fails, fall back to cached status
+            console.log(`⚠️ Auth retry failed, using fallback status`);
+            return documentService._createFallbackStatus(processId);
           }
         }
         
-        // Enhanced error handling
+        console.error(`❌ [${new Date().toISOString()}] Status check failed after ${duration}ms:`, error);
+        
+        // For server errors, also use fallback status to keep UI working
+        if (error.response && error.response.status >= 500) {
+          console.log(`⚠️ Server error (${error.response.status}), using fallback status`);
+          return documentService._createFallbackStatus(processId);
+        }
+        
+        // For 404 errors, the translation might have been removed
+        if (error.response && error.response.status === 404) {
+          const errorData = {
+            message: 'Translation process not found',
+            statusCode: 404,
+            shouldRetry: false
+          };
+          throw errorData;
+        }
+        
+        // For other client errors, throw a structured error
         const errorData = {
           message: 'Failed to check translation status',
           statusCode: error.response?.status || 500,
           originalError: error.message,
           shouldRetry: true
         };
-        
-        if (error.code === 'ECONNABORTED') {
-          errorData.message = 'Request timed out. The server might be processing a large document.';
-        } else if (error.response?.status === 404) {
-          errorData.message = 'Translation process not found';
-          errorData.shouldRetry = false;
-        }
         
         throw errorData;
       } finally {
@@ -348,19 +443,52 @@ export const documentService = {
       return documentService._activeRequests.get(requestKey);
     }
     
+    // Create an AbortController for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15-second timeout for results
+    
     const startTime = Date.now();
     console.log(`🔄 [${new Date().toISOString()}] Fetching translation result for process: ${processId}`);
     
     // Create the promise for this request
     const requestPromise = (async () => {
       try {
-        const response = await api.get(`/documents/result/${processId}`);
+        const response = await api.get(`/documents/result/${processId}`, {
+          signal: controller.signal,
+          timeout: 15000
+        });
+        
+        // Clear timeout
+        clearTimeout(timeoutId);
+        
         const duration = Date.now() - startTime;
         console.log(`✅ [${new Date().toISOString()}] Translation result fetched successfully in ${duration}ms, content length: ${response.data.translatedText?.length || 0} chars`);
+        
+        // Update status to completed in our cache
+        documentService._updateLastKnownStatus(processId, {
+          processId: processId,
+          status: 'completed',
+          progress: 100,
+          currentPage: response.data.metadata?.currentPage || 0,
+          totalPages: response.data.metadata?.totalPages || 0
+        });
+        
         return response.data;
       } catch (error) {
+        // Clear timeout
+        clearTimeout(timeoutId);
+        
         const duration = Date.now() - startTime;
         console.error(`❌ [${new Date().toISOString()}] Result fetch failed after ${duration}ms:`, error);
+        
+        // Handle timeouts
+        if (
+          error.name === 'AbortError' || 
+          error.code === 'ECONNABORTED' || 
+          error.message.includes('timeout')
+        ) {
+          throw new Error('Request timed out while fetching translation results. The server might be busy processing a large document. Please try again in a moment.');
+        }
         
         // Handle authentication errors
         if (error.response && error.response.status === 401) {
@@ -380,8 +508,6 @@ export const documentService = {
           throw new Error('Translation not found. The process may have expired.');
         } else if (error.response?.status === 400) {
           throw new Error('Translation is not yet complete. Please wait until it finishes processing.');
-        } else if (error.code === 'ECONNABORTED') {
-          throw new Error('Request timed out. The translation might be very large.');
         }
         
         throw new Error('Failed to fetch translation result. Please try again later.');
