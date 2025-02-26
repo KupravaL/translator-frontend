@@ -25,21 +25,21 @@ export default function DocumentTranslationPage() {
 
   const [isCopied, setIsCopied] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState('en');
-  const [abortController, setAbortController] = useState(null);
+  const [pollingInterval, setPollingInterval] = useState(null);
 
   // Register auth interceptor on mount
   useEffect(() => {
     registerAuthInterceptor();
   }, []);
 
-  // Cleanup abort controller on unmount
+  // Cleanup polling interval on unmount
   useEffect(() => {
     return () => {
-      if (abortController) {
-        abortController.abort();
+      if (pollingInterval) {
+        clearInterval(pollingInterval);
       }
     };
-  }, [abortController]);
+  }, [pollingInterval]);
 
   const onTranslate = async (file, fromLang, toLang) => {
     if (!file) {
@@ -103,7 +103,12 @@ export default function DocumentTranslationPage() {
   
   // Polling function
   const startPollingStatus = (processId) => {
-    const statusInterval = setInterval(async () => {
+    // Clear any existing interval first
+    if (pollingInterval) {
+      clearInterval(pollingInterval);
+    }
+
+    const intervalId = setInterval(async () => {
       try {
         const statusResponse = await documentService.checkTranslationStatus(processId);
         
@@ -115,11 +120,13 @@ export default function DocumentTranslationPage() {
         
         // Check if completed or failed
         if (statusResponse.status === 'completed') {
-          clearInterval(statusInterval);
+          clearInterval(intervalId);
+          setPollingInterval(null);
           // Fetch the results
           fetchTranslationResults(processId);
         } else if (statusResponse.status === 'failed') {
-          clearInterval(statusInterval);
+          clearInterval(intervalId);
+          setPollingInterval(null);
           setTranslationStatus(prev => ({
             ...prev,
             isLoading: false,
@@ -130,7 +137,8 @@ export default function DocumentTranslationPage() {
         
       } catch (error) {
         console.error('Status check error:', error);
-        clearInterval(statusInterval);
+        clearInterval(intervalId);
+        setPollingInterval(null);
         setTranslationStatus(prev => ({
           ...prev,
           isLoading: false,
@@ -141,7 +149,7 @@ export default function DocumentTranslationPage() {
     }, 2000); // Poll every 2 seconds
     
     // Store interval ID for cleanup
-    setAbortController(statusInterval);
+    setPollingInterval(intervalId);
   };
   
   // Fetch results function
@@ -174,9 +182,9 @@ export default function DocumentTranslationPage() {
   
   // Cancel function
   const handleCancel = () => {
-    if (typeof abortController === 'number') {
-      clearInterval(abortController);
-      setAbortController(null);
+    if (pollingInterval) {
+      clearInterval(pollingInterval);
+      setPollingInterval(null);
       setTranslationStatus(prev => ({
         ...prev,
         isLoading: false,
