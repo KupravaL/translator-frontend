@@ -363,16 +363,10 @@ export const documentService = {
         const duration = Date.now() - startTime;
         
         // Handle timeout cases - both AbortController timeout and axios timeout
-        if (
-          error.name === 'AbortError' || 
-          error.code === 'ECONNABORTED' || 
-          error.message.includes('timeout') ||
-          // Also treat 'pending' responses from Render.com as timeouts
-          (error.response && error.response.status === 503)
-        ) {
-          console.log(`⏳ [${new Date().toISOString()}] Status check timed out or pending after ${duration}ms - providing fallback status`);
+        if (error.name === 'AbortError' || error.code === 'ECONNABORTED' || error.message.includes('timeout') || error.message === 'canceled') {
+          console.log(`⏳ Status check timed out or canceled - assuming translation is still pending`);
           
-          // Return a fallback status from our cache or a default pending state
+          // Return a fallback status object to keep the polling going
           return documentService._createFallbackStatus(processId);
         }
         

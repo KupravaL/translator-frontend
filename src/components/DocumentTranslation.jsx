@@ -303,7 +303,6 @@ export default function DocumentTranslationPage() {
       } else {
         // Continue polling if still in progress
         const pollInterval = getPollInterval();
-        console.log(`🔄 Scheduling next poll in ${pollInterval}ms`);
         statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, pollInterval);
       }
     } catch (error) {
