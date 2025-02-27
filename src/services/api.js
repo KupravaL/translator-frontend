@@ -362,110 +362,28 @@ export const documentService = {
   },
   
   checkTranslationStatus: async (processId) => {
-    // Deduplicate concurrent status checks for the same processId
-    const requestKey = `status-${processId}`;
-    
-    // If there's already an active request for this processId, return its promise
-    if (documentService._activeRequests.has(requestKey)) {
-      console.log(`⏳ [${new Date().toISOString()}] Reusing existing status check for process: ${processId}`);
-      return documentService._activeRequests.get(requestKey);
-    }
-    
-    // Create an AbortController to handle timeouts
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8-second timeout
-    
-    // Create a new request
-    const startTime = Date.now();
-    console.log(`🔄 [${new Date().toISOString()}] Checking translation status for process: ${processId}`);
-    
-    // Create the promise for this request
-    const requestPromise = (async () => {
-      try {
-        const response = await api.get(`/documents/status/${processId}`, {
-          signal: controller.signal,
-          timeout: 8000 // Also set axios timeout
-        });
-        
-        // Clear the timeout since the request completed
-        clearTimeout(timeoutId);
-        
-        const duration = Date.now() - startTime;
-        console.log(`✅ [${new Date().toISOString()}] Status check completed in ${duration}ms - Status: ${response.data.status}, Progress: ${response.data.progress}%`);
-        
-        // Update the last known status
-        documentService._updateLastKnownStatus(processId, response.data);
-        
-        return response.data;
-      } catch (error) {
-        // Clear the timeout
-        clearTimeout(timeoutId);
-        
-        const duration = Date.now() - startTime;
-        
-        // Handle timeout cases - both AbortController timeout and axios timeout
-        if (error.name === 'AbortError' || error.code === 'ECONNABORTED' || error.message.includes('timeout') || error.message === 'canceled') {
-          console.log(`⏳ Status check timed out or canceled - assuming translation is still pending`);
-          
-          // Return a fallback status object to keep the polling going
-          return documentService._createFallbackStatus(processId);
-        }
-        
-        // Handle authentication errors
-        if (error.response && error.response.status === 401) {
-          try {
-            return await documentService._handleAuthError(
-              error, 
-              'status', 
-              () => api.get(`/documents/status/${processId}`)
-            ).then(response => {
-              documentService._updateLastKnownStatus(processId, response.data);
-              return response.data;
-            });
-          } catch (retryError) {
-            // If auth retry fails, fall back to cached status
-            console.log(`⚠️ Auth retry failed, using fallback status`);
-            return documentService._createFallbackStatus(processId);
-          }
-        }
-        
-        console.error(`❌ [${new Date().toISOString()}] Status check failed after ${duration}ms:`, error);
-        
-        // For server errors, also use fallback status to keep UI working
-        if (error.response && error.response.status >= 500) {
-          console.log(`⚠️ Server error (${error.response.status}), using fallback status`);
-          return documentService._createFallbackStatus(processId);
-        }
-        
-        // For 404 errors, the translation might have been removed
-        if (error.response && error.response.status === 404) {
-          const errorData = {
-            message: 'Translation process not found',
-            statusCode: 404,
-            shouldRetry: false
-          };
-          throw errorData;
-        }
-        
-        // For other client errors, throw a structured error
-        const errorData = {
-          message: 'Failed to check translation status',
-          statusCode: error.response?.status || 500,
-          originalError: error.message,
-          shouldRetry: true
+    try {
+      // Use a longer timeout for status checks
+      const response = await api.get(`/documents/status/${processId}`, {
+        timeout: 15000 // 15 seconds timeout
+      });
+      return response.data;
+    } catch (error) {
+      // For network errors or timeouts, don't immediately fail
+      // Instead return a "pending" status to allow continued polling
+      if (error.code === 'ECONNABORTED' || error.message.includes('timeout') || !error.response) {
+        console.warn(`Network issue while checking status for ${processId} - assuming still pending`);
+        return {
+          processId: processId,
+          status: 'pending',
+          progress: 0,
+          currentPage: 0,
+          totalPages: 0,
+          isNetworkEstimate: true
         };
-        
-        throw errorData;
-      } finally {
-        // Remove this request from the active requests map
-        documentService._activeRequests.delete(requestKey);
       }
-    })();
-    
-    // Store the promise in the active requests map
-    documentService._activeRequests.set(requestKey, requestPromise);
-    
-    return requestPromise;
+      throw error;
+    }
   },
   
   getTranslationResult: async (processId) => {

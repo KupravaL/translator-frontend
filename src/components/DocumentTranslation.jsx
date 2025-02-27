@@ -233,81 +233,11 @@ export default function DocumentTranslationPage() {
     pollAttemptRef.current += 1;
     console.log(`🔄 Polling attempt #${pollAttemptRef.current} for process: ${processId}`);
     
-    // Keep track of how long this process has been active
-    const processStartTime = translationStatus.processStartTime || Date.now();
-    const processRuntime = getProcessRuntime();
-    
     try {
       const statusData = await documentService.checkTranslationStatus(processId);
       
-      // Check if this is a fallback status (not a real server response)
-      const isFallback = statusData.isFallback === true;
-      setLastFallbackStatus(isFallback);
-      
-      if (isFallback) {
-        console.log(`⚠️ Using fallback status information as the server response is stalled`);
-        
-        // Don't reset consecutive failures for fallback responses
-        // But don't increment them either, we're managing to get some information
-        
-        // If we've been using fallback statuses for too long, we should show a message
-        if (timeCounter > 60) { // After a minute of fallbacks
-          toast.warning("The server is taking longer than expected. The translation is still in progress.", {
-            id: "stalled-status",
-            duration: 10000
-          });
-        }
-      } else {
-        // Only reset consecutive failures on real success
-        setConsecFailures(0);
-        setStatusCheckStalled(false);
-        
-        // Stop simulated progress if we get a real status update
-        if (simulatedProgress.active) {
-          setSimulatedProgress({
-            active: false,
-            value: 0,
-            page: 0,
-            total: 0
-          });
-          
-          if (forcedProgressRef.current) {
-            clearInterval(forcedProgressRef.current);
-            forcedProgressRef.current = null;
-          }
-        }
-      }
-      
-      // Check for dead process (no progress for a very long time)
-      const noProgressTime = lastStatusRef.current 
-        ? (statusData.progress === lastStatusRef.current.progress 
-           && statusData.currentPage === lastStatusRef.current.currentPage
-           && Date.now() - lastStatusRef.current.timestamp > 10 * 60 * 1000) // 10 minutes
-        : false;
-      
-      // If the process has been running for more than 30 minutes with the same progress for 10+ minutes, assume it's dead
-      if (getProcessRuntime() > 30 * 60 && noProgressTime) {
-        console.warn(`⚠️ Process appears to be dead - no progress for 10+ minutes and running for ${Math.floor(getProcessRuntime()/60)} minutes`);
-        
-        setTranslationStatus(prev => ({
-          ...prev,
-          isLoading: false,
-          status: 'stalled',
-          error: 'The translation process appears to be stalled. Please try again.',
-        }));
-        
-        toast.error('Translation process stalled. Please try again with a smaller document.');
-        return;
-      }
-      
-      // Store latest status for comparison
-      lastStatusRef.current = {
-        status: statusData.status,
-        progress: statusData.progress,
-        currentPage: statusData.currentPage,
-        totalPages: statusData.totalPages,
-        timestamp: Date.now()
-      };
+      // Reset consecutive failures on success
+      setConsecFailures(0);
       
       // Update status in state
       setTranslationStatus(prev => ({
@@ -316,9 +246,7 @@ export default function DocumentTranslationPage() {
         status: statusData.status,
         currentPage: statusData.currentPage,
         totalPages: statusData.totalPages,
-        lastStatusUpdate: Date.now(),
-        processStartTime: prev.processStartTime || processStartTime, // Keep track of when this process started
-        estimatedTimeRemaining: statusData.estimatedTimeRemaining
+        lastStatusUpdate: Date.now()
       }));
       
       // Check if translation completed or failed
@@ -333,7 +261,6 @@ export default function DocumentTranslationPage() {
           error: 'Translation failed. Please try again.',
           status: 'failed'
         }));
-        toast.error('Translation failed');
       } else {
         // Continue polling if still in progress
         const pollInterval = getPollInterval();
@@ -345,25 +272,30 @@ export default function DocumentTranslationPage() {
       // Increase consecutive failures
       setConsecFailures(prev => prev + 1);
       
-      // Check if we should give up (more than 15 consecutive failures)
-      if (consecFailures >= 15) {
+      // Don't give up too easily - continue polling with exponential backoff
+      // Only stop polling after a very high number of consecutive failures
+      if (consecFailures > 20) {
         console.error('🚨 Too many consecutive failures, giving up');
         setTranslationStatus(prev => ({
           ...prev,
           isLoading: false,
           error: 'Lost connection to the server. The translation may still be processing in the background.',
-          status: 'unknown'
+          status: 'timeout', // Use timeout status instead of failed
+          processId: processId // Keep the process ID for potential recovery
         }));
-        toast.error('Lost connection to the server');
+        
+        toast.warning('Lost connection to the server. Your document might still be processing in the background.', {
+          duration: 5000
+        });
         return;
       }
       
-      // Continue polling after a delay
-      const pollInterval = getPollInterval();
-      console.log(`🔄 Scheduling retry poll in ${pollInterval}ms after error`);
-      statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, pollInterval);
+      // Continue polling after a delay with exponential backoff
+      const backoffTime = Math.min(2000 * Math.pow(1.5, consecFailures), 30000); // Up to 30 seconds
+      console.log(`🔄 Scheduling retry poll in ${backoffTime}ms after error`);
+      statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, backoffTime);
     }
-  }, [translationStatus, consecFailures, getPollInterval, simulatedProgress.active, timeCounter]);
+  }, [translationStatus, consecFailures, getPollInterval]);
   
 
   // Effect to start polling whenever processId changes
