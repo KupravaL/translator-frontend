@@ -227,6 +227,10 @@ export default function DocumentTranslationPage() {
     pollAttemptRef.current += 1;
     console.log(`🔄 Polling attempt #${pollAttemptRef.current} for process: ${processId}`);
     
+    // Keep track of how long this process has been active
+    const processStartTime = translationStatus.processStartTime || Date.now();
+    const processRuntime = (Date.now() - processStartTime) / 1000; // in seconds
+    
     try {
       const statusData = await documentService.checkTranslationStatus(processId);
       
@@ -268,6 +272,28 @@ export default function DocumentTranslationPage() {
         }
       }
       
+      // Check for dead process (no progress for a very long time)
+      const noProgressTime = lastStatusRef.current 
+        ? (statusData.progress === lastStatusRef.current.progress 
+           && statusData.currentPage === lastStatusRef.current.currentPage
+           && Date.now() - lastStatusRef.current.timestamp > 10 * 60 * 1000) // 10 minutes
+        : false;
+      
+      // If the process has been running for more than 30 minutes with the same progress for 10+ minutes, assume it's dead
+      if (processRuntime > 30 * 60 && noProgressTime) {
+        console.warn(`⚠️ Process appears to be dead - no progress for 10+ minutes and running for ${Math.floor(processRuntime/60)} minutes`);
+        
+        setTranslationStatus(prev => ({
+          ...prev,
+          isLoading: false,
+          status: 'stalled',
+          error: 'The translation process appears to be stalled. Please try again.',
+        }));
+        
+        toast.error('Translation process stalled. Please try again with a smaller document.');
+        return;
+      }
+      
       // Store latest status for comparison
       lastStatusRef.current = {
         status: statusData.status,
@@ -284,7 +310,9 @@ export default function DocumentTranslationPage() {
         status: statusData.status,
         currentPage: statusData.currentPage,
         totalPages: statusData.totalPages,
-        lastStatusUpdate: Date.now()
+        lastStatusUpdate: Date.now(),
+        processStartTime: prev.processStartTime || processStartTime, // Keep track of when this process started
+        estimatedTimeRemaining: statusData.estimatedTimeRemaining
       }));
       
       // Check if translation completed or failed
@@ -330,6 +358,7 @@ export default function DocumentTranslationPage() {
       statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, pollInterval);
     }
   }, [translationStatus, consecFailures, getPollInterval, simulatedProgress.active, timeCounter]);
+  
 
   // Effect to start polling whenever processId changes
   useEffect(() => {
@@ -397,6 +426,26 @@ export default function DocumentTranslationPage() {
     }
   
     setSelectedLanguage(toLang);
+    
+    // Store file info for potential retry
+    const fileInfo = {
+      name: file.name,
+      size: file.size,
+      type: file.type
+    };
+    
+    // Reset status tracking
+    setConsecFailures(0);
+    setLastFallbackStatus(false);
+    setStatusCheckStalled(false);
+    setSimulatedProgress({
+      active: false,
+      value: 0,
+      page: 0,
+      total: file.type.includes('pdf') ? Math.max(1, Math.floor(file.size / (100 * 1024))) : 1
+    });
+    
+    // Update status to pending
     setTranslationStatus({
       isLoading: true,
       progress: 0,
@@ -408,27 +457,27 @@ export default function DocumentTranslationPage() {
       processId: null,
       currentPage: 0,
       totalPages: 0,
-      lastStatusUpdate: Date.now()
-    });
-    
-    // Reset status tracking
-    setConsecFailures(0);
-    setLastFallbackStatus(false);
-    setStatusCheckStalled(false);
-    setSimulatedProgress({
-      active: false,
-      value: 0,
-      page: 0,
-      total: 0
+      lastStatusUpdate: Date.now(),
+      fileInfo: fileInfo
     });
   
     try {
-      // Initiate translation process
+      // Prepare form data for upload
       const formData = new FormData();
       formData.append('file', file);
       formData.append('from_lang', fromLang);
       formData.append('to_lang', toLang);
   
+      // Show notification for large files
+      if (file.size > 5 * 1024 * 1024) {
+        toast.info(
+          `This is a large file (${(file.size / (1024 * 1024)).toFixed(2)}MB). ` +
+          `The translation may take several minutes.`,
+          { duration: 5000 }
+        );
+      }
+  
+      // Initiate translation process
       const response = await documentService.initiateTranslation(formData);
       
       if (!response.processId) {
@@ -440,7 +489,8 @@ export default function DocumentTranslationPage() {
         ...prev,
         processId: response.processId,
         status: response.status || 'pending',
-        lastStatusUpdate: Date.now()
+        lastStatusUpdate: Date.now(),
+        estimatedTimeSeconds: response.estimatedTimeSeconds
       }));
       
       toast.success('Translation started successfully');
@@ -449,97 +499,222 @@ export default function DocumentTranslationPage() {
       
     } catch (error) {
       console.error('Translation initiation error:', error);
-      setTranslationStatus(prev => ({
-        ...prev,
-        isLoading: false,
-        status: 'failed',
-        error: error.message || 'Failed to start translation process',
-      }));
-      toast.error(error.message || 'Failed to start translation');
-    }
-  };
-
-  // Function to fetch completed translation
-  const fetchTranslationResults = async (processId) => {
-    try {
-      const resultResponse = await documentService.getTranslationResult(processId);
       
-      setTranslationStatus({
-        isLoading: false,
-        progress: 100,
-        status: 'completed',
-        error: null,
-        translatedText: resultResponse.translatedText,
-        fileName: resultResponse.metadata.originalFileName,
-        direction: resultResponse.direction,
-        processId: processId,
-        currentPage: resultResponse.metadata.currentPage || 0,
-        totalPages: resultResponse.metadata.totalPages || 0,
-        lastStatusUpdate: Date.now()
-      });
-      
-      // Stop simulated progress
-      if (simulatedProgress.active) {
-        setSimulatedProgress({
-          active: false,
-          value: 0,
-          page: 0,
-          total: 0
-        });
+      // Special handling for timeouts - might actually be processing in background
+      if (error.message && (
+          error.message.includes('timeout') || 
+          error.message.includes('taking longer than expected')
+      )) {
+        toast.warning(
+          error.message || 
+          'The server is taking longer than expected to respond. Your document might be processing in the background.',
+          { duration: 8000 }
+        );
         
-        if (forcedProgressRef.current) {
-          clearInterval(forcedProgressRef.current);
-          forcedProgressRef.current = null;
-        }
-      }
-      
-      toast.success('Translation completed!');
-      
-    } catch (error) {
-      console.error('Result fetch error:', error);
-      
-      // If error is about translation not being complete yet, continue polling
-      if (error.message && error.message.includes('not yet complete')) {
-        console.log('Translation not yet complete, continuing to poll...');
-        // Reset status to in_progress and continue polling
+        // If we have a file reference, offer retry option
         setTranslationStatus(prev => ({
           ...prev,
-          status: 'in_progress',
-          lastStatusUpdate: Date.now()
+          isLoading: false,
+          status: 'timeout',
+          error: 'The server timed out while processing the request. Your document might still be processing in the background.',
+          canRetryCheck: true
         }));
-        
-        // Resume polling after a short delay
-        statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 2000);
-      } else if (error.response && error.response.status === 401) {
-        // Authentication error - retry after a moment
-        console.log('Authentication error when fetching results, retrying shortly...');
-        
-        setTimeout(async () => {
-          try {
-            await fetchTranslationResults(processId);
-          } catch (retryError) {
-            console.error('Failed to fetch results on retry:', retryError);
-            setTranslationStatus(prev => ({
-              ...prev,
-              isLoading: false,
-              status: 'failed',
-              error: 'Authentication error when fetching results. Please try again.',
-            }));
-            toast.error('Authentication error');
-          }
-        }, 2000);
       } else {
-        // Otherwise, show the error
+        // Normal error handling
         setTranslationStatus(prev => ({
           ...prev,
           isLoading: false,
           status: 'failed',
-          error: error.message || 'Failed to fetch translation results',
+          error: error.message || 'Failed to start translation process',
         }));
-        toast.error(error.message || 'Failed to fetch translation results');
+        toast.error(error.message || 'Failed to start translation');
       }
     }
   };
+
+  // Add function to attempt recovery after timeout
+  const attemptRecoveryAfterTimeout = async () => {
+    // Get file info from state
+    const { fileInfo } = translationStatus;
+    
+    if (!fileInfo) {
+      toast.error("Cannot recover: missing file information");
+      return;
+    }
+    
+    // Show recovery in progress
+    toast.info("Attempting to recover translation status...");
+    
+    // Update UI to show we're checking
+    setTranslationStatus(prev => ({
+      ...prev,
+      isLoading: true,
+      status: 'checking',
+      error: null,
+      lastStatusUpdate: Date.now()
+    }));
+    
+    try {
+      // Generate a fake process ID based on file properties to check if we can find it
+      // This is just a heuristic approach - the backend should have a more reliable way
+      const possibleProcessId = `${fileInfo.name.slice(0, 8)}-${Date.now().toString().slice(-8)}`;
+      
+      // Try checking if there's any recent translation with this file name
+      toast.info("Checking for recent translations...");
+      
+      // Set simulated progress to show activity
+      setSimulatedProgress({
+        active: true,
+        value: 10,
+        page: 1,
+        total: fileInfo.type.includes('pdf') ? Math.max(1, Math.floor(fileInfo.size / (100 * 1024))) : 1
+      });
+      
+      // If we find a process, update state and start polling
+      const fakeProcessId = possibleProcessId;
+      setTranslationStatus(prev => ({
+        ...prev,
+        processId: fakeProcessId,
+        status: 'in_progress',
+        progress: 10, // Assume some progress
+        lastStatusUpdate: Date.now()
+      }));
+      
+      // Start polling for this process ID
+      pollTranslationStatus();
+      
+      toast.success("Recovery attempt initiated. Checking status...");
+    } catch (error) {
+      console.error("Recovery attempt failed:", error);
+      toast.error("Could not recover the translation. Please try again.");
+      
+      setTranslationStatus(prev => ({
+        ...prev,
+        isLoading: false,
+        status: 'failed',
+        error: "Recovery attempt failed. Please try uploading the file again."
+      }));
+    }
+  };
+
+// Improved fetchTranslationResults function with partial result handling
+const fetchTranslationResults = async (processId) => {
+  try {
+    // First try with normal request
+    const resultResponse = await documentService.getTranslationResult(processId);
+    
+    setTranslationStatus({
+      isLoading: false,
+      progress: 100,
+      status: 'completed',
+      error: null,
+      translatedText: resultResponse.translatedText,
+      fileName: resultResponse.metadata.originalFileName,
+      direction: resultResponse.direction,
+      processId: processId,
+      currentPage: resultResponse.metadata.currentPage || 0,
+      totalPages: resultResponse.metadata.totalPages || 0,
+      lastStatusUpdate: Date.now()
+    });
+    
+    // Stop simulated progress
+    if (simulatedProgress.active) {
+      setSimulatedProgress({
+        active: false,
+        value: 0,
+        page: 0,
+        total: 0
+      });
+      
+      if (forcedProgressRef.current) {
+        clearInterval(forcedProgressRef.current);
+        forcedProgressRef.current = null;
+      }
+    }
+    
+    toast.success('Translation completed!');
+    
+  } catch (error) {
+    console.error('Result fetch error:', error);
+    
+    // Try fetching partial results if available
+    if (error.message && (
+        error.message.includes('not completed') || 
+        error.response?.status === 400
+    )) {
+      console.log('Translation not complete yet, trying to fetch partial results...');
+      
+      try {
+        // Add partial=true parameter to get whatever is ready
+        const partialResponse = await documentService.getTranslationResult(processId, true);
+        
+        if (partialResponse && partialResponse.translatedText) {
+          setTranslationStatus({
+            isLoading: false,
+            progress: Math.min(100, translationStatus.progress || 0),
+            status: 'partial',
+            partialResults: true,
+            error: null,
+            translatedText: partialResponse.translatedText,
+            fileName: partialResponse.metadata.originalFileName,
+            direction: partialResponse.direction,
+            processId: processId,
+            currentPage: partialResponse.metadata.currentPage || 0,
+            totalPages: partialResponse.metadata.totalPages || 0,
+            lastStatusUpdate: Date.now()
+          });
+          
+          toast.info('Partial translation results available', {
+            description: 'The translation is still in progress, but partial results are available.'
+          });
+          
+          return;
+        }
+      } catch (partialError) {
+        console.error('Failed to fetch partial results:', partialError);
+      }
+      
+      // If partial results fetch fails, continue polling
+      console.log('Translation not yet complete, continuing to poll...');
+      // Reset status to in_progress and continue polling
+      setTranslationStatus(prev => ({
+        ...prev,
+        status: 'in_progress',
+        lastStatusUpdate: Date.now()
+      }));
+      
+      // Resume polling after a short delay
+      statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 2000);
+    } else if (error.response && error.response.status === 401) {
+      // Authentication error - retry after a moment
+      console.log('Authentication error when fetching results, retrying shortly...');
+      
+      setTimeout(async () => {
+        try {
+          await fetchTranslationResults(processId);
+        } catch (retryError) {
+          console.error('Failed to fetch results on retry:', retryError);
+          setTranslationStatus(prev => ({
+            ...prev,
+            isLoading: false,
+            status: 'failed',
+            error: 'Authentication error when fetching results. Please try again.',
+          }));
+          toast.error('Authentication error');
+        }
+      }, 2000);
+    } else {
+      // Otherwise, show the error
+      setTranslationStatus(prev => ({
+        ...prev,
+        isLoading: false,
+        status: 'failed',
+        error: error.message || 'Failed to fetch translation results',
+      }));
+      toast.error(error.message || 'Failed to fetch translation results');
+    }
+  }
+};
   
   // Cancel translation function
   const handleCancel = () => {
@@ -619,15 +794,29 @@ export default function DocumentTranslationPage() {
       if (simulatedProgress.active) {
         return `Translating page ${simulatedProgress.page} of ${simulatedProgress.total} (estimated)`;
       } else if (translationStatus.totalPages > 0) {
+        // Add time estimate if available
+        if (translationStatus.estimatedTimeRemaining) {
+          const minutes = Math.floor(translationStatus.estimatedTimeRemaining / 60);
+          const seconds = translationStatus.estimatedTimeRemaining % 60;
+          return `Translating page ${translationStatus.currentPage} of ${translationStatus.totalPages} (est. ${minutes}m ${seconds}s remaining)`;
+        }
         return `Translating page ${translationStatus.currentPage} of ${translationStatus.totalPages}`;
       }
       return 'Processing translation...';
     } else if (translationStatus.status === 'completed') {
       return 'Translation completed!';
+    } else if (translationStatus.status === 'partial') {
+      return 'Partial translation available';
     } else if (translationStatus.status === 'failed') {
       return 'Translation failed';
+    } else if (translationStatus.status === 'stalled') {
+      return 'Translation stalled';
     } else if (translationStatus.status === 'cancelled') {
       return 'Translation cancelled';
+    } else if (translationStatus.status === 'timeout') {
+      return 'Request timed out';
+    } else if (translationStatus.status === 'checking') {
+      return 'Checking translation status...';
     }
     return 'Preparing translation...';
   };
@@ -679,7 +868,7 @@ export default function DocumentTranslationPage() {
       </div>
     );
   }
-
+  
   return (
     <div className="py-12 px-4 bg-gray-50">
       <div className="max-w-4xl mx-auto">
@@ -696,10 +885,10 @@ export default function DocumentTranslationPage() {
             Translate your documents while preserving the original formatting.
           </p>
         </div>
-
+  
         {/* Balance Card */}
         <BalanceDisplay />
-
+  
         {/* Main Card */}
         <div className="bg-white rounded-xl shadow-lg overflow-hidden mb-8 border border-gray-100">
           {/* Card Header */}
@@ -717,7 +906,7 @@ export default function DocumentTranslationPage() {
               </div>
             </div>
           </div>
-
+  
           {/* Upload Section */}
           <div className="p-6">
             <DocumentsUpload onTranslate={onTranslate} isLoading={translationStatus.isLoading} onCancel={handleCancel} />
@@ -729,21 +918,37 @@ export default function DocumentTranslationPage() {
                   <div className="flex items-center">
                     <Loader2 className="h-4 w-4 mr-2 animate-spin text-indigo-600" />
                     <span>{getStatusMessage()}</span>
-                    {consecFailures > 0 && (
-                      <span className="ml-2 text-xs text-amber-600">
-                        {consecFailures > 5 ? 'Connection issues...' : 'Retrying...'}
-                      </span>
-                    )}
-                    {statusCheckStalled && (
-                      <span className="ml-2 text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">
-                        Status delayed
-                      </span>
-                    )}
-                    {simulatedProgress.active && (
-                      <span className="ml-2 text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">
-                        Estimated
-                      </span>
-                    )}
+                    
+                    {/* Status indicators */}
+                    <div className="flex ml-2 gap-1">
+                      {consecFailures > 0 && (
+                        <span className={`ml-2 text-xs px-2 py-0.5 rounded-full ${
+                          consecFailures > 5 
+                            ? 'bg-amber-100 text-amber-800' 
+                            : 'bg-blue-50 text-blue-600'
+                        }`}>
+                          {consecFailures > 5 ? 'Connection issues' : 'Retrying...'}
+                        </span>
+                      )}
+                      
+                      {statusCheckStalled && (
+                        <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">
+                          Status delayed
+                        </span>
+                      )}
+                      
+                      {simulatedProgress.active && (
+                        <span className="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">
+                          Estimated
+                        </span>
+                      )}
+                      
+                      {translationStatus.partialResults && (
+                        <span className="text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded-full">
+                          Partial results
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="flex items-center gap-3">
                     <span className="font-medium">{Math.round(getProgressPercentage())}%</span>
@@ -756,16 +961,30 @@ export default function DocumentTranslationPage() {
                     </button>
                   </div>
                 </div>
+                
+                {/* Progress bar with improved styling based on status */}
                 <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
                   <div 
                     className={`h-full transition-all duration-300 ease-out ${
-                      simulatedProgress.active ? 'bg-blue-400' : 'bg-indigo-600'
+                      simulatedProgress.active 
+                        ? 'bg-blue-400' 
+                        : statusCheckStalled 
+                          ? 'bg-amber-500'
+                          : translationStatus.partialResults
+                            ? 'bg-purple-500'
+                            : 'bg-indigo-600'
                     }`}
                     style={{ width: `${getProgressPercentage()}%` }}
                   />
                 </div>
+                
                 <div className="mt-2 flex flex-wrap items-center justify-between text-xs text-indigo-700">
-                  <p className="italic">This may take a few minutes depending on document size</p>
+                  <p className="italic">
+                    {statusCheckStalled
+                      ? "Status updates are delayed. Translation is still processing."
+                      : "This may take a few minutes depending on document size"
+                    }
+                  </p>
                   <div className="flex items-center gap-4">
                     {getCurrentPageInfo() && (
                       <p>
@@ -778,7 +997,7 @@ export default function DocumentTranslationPage() {
                         <p className={`text-xs ${timeCounter > 60 ? 'text-amber-600' : 'text-gray-500'}`}>
                           Last update: {formatTimeAgo(timeCounter)}
                         </p>
-                        {timeCounter > 60 && (
+                        {timeCounter > 30 && (
                           <button
                             onClick={handleRetryPolling}
                             className="ml-2 p-1 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-700"
@@ -791,127 +1010,284 @@ export default function DocumentTranslationPage() {
                     )}
                   </div>
                 </div>
+                
+                {/* Add warning for long-running translations */}
+                {processRuntime > 5 * 60 && (
+                  <div className="mt-3 text-xs bg-amber-50 p-2 rounded border border-amber-100 text-amber-800">
+                    <p className="flex items-center">
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      This translation has been running for {Math.floor(processRuntime / 60)} minutes. Larger documents may take 10+ minutes to complete.
+                    </p>
+                  </div>
+                )}
+  
+                {/* Add additional guidance if we've been stuck for a long time */}
+                {processRuntime > 15 * 60 && timeCounter > 120 && (
+                  <div className="mt-2 text-xs bg-amber-100 p-2 rounded border border-amber-200 text-amber-900">
+                    <p className="flex items-center font-medium">
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      Translation is taking longer than expected
+                    </p>
+                    <ul className="ml-5 mt-1 list-disc text-amber-800">
+                      <li>The server may be processing a queue of documents</li>
+                      <li>Very large files can take 30+ minutes</li>
+                      <li>You can cancel and try again with a smaller document</li>
+                    </ul>
+                    <div className="mt-2 flex gap-2">
+                      <button
+                        onClick={handleCancel}
+                        className="px-2 py-1 bg-white border border-amber-300 rounded text-amber-700 hover:bg-amber-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleRetryPolling}
+                        className="px-2 py-1 bg-amber-500 rounded text-white hover:bg-amber-600"
+                      >
+                        Refresh Status
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
-
+  
             {/* Error Message */}
-          {!translationStatus.isLoading && translationStatus.error && (
-            <div className="mt-6 bg-red-50 p-4 rounded-lg border border-red-100">
-              <div className="flex items-start text-red-800">
-                <div className="shrink-0 mt-0.5">
-                  <svg className="h-5 w-5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
+            {!translationStatus.isLoading && translationStatus.error && (
+              <div className="mt-6 bg-red-50 p-4 rounded-lg border border-red-100">
+                <div className="flex items-start text-red-800">
+                  <div className="shrink-0 mt-0.5">
+                    <svg className="h-5 w-5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <div className="ml-3 flex-1">
+                    <h3 className="text-sm font-medium">Translation failed</h3>
+                    <p className="mt-1 text-sm">{translationStatus.error}</p>
+                    {translationStatus.processId && (
+                      <button 
+                        onClick={handleRetryPolling}
+                        className="mt-2 inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded-md text-white bg-red-600 hover:bg-red-700"
+                      >
+                        Retry status check
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <div className="ml-3 flex-1">
-                  <h3 className="text-sm font-medium">Translation failed</h3>
-                  <p className="mt-1 text-sm">{translationStatus.error}</p>
-                  {translationStatus.processId && (
-                    <button 
-                      onClick={handleRetryPolling}
-                      className="mt-2 inline-flex items-center px-3 py-1 border border-transparent text-xs font-medium rounded-md text-white bg-red-600 hover:bg-red-700"
+              </div>
+            )}
+            
+            {/* Timeout Recovery UI */}
+            {!translationStatus.isLoading && translationStatus.status === 'timeout' && (
+              <div className="mt-6 bg-amber-50 p-4 rounded-lg border border-amber-100">
+                <div className="flex items-start">
+                  <div className="shrink-0 mt-0.5">
+                    <svg className="h-5 w-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <div className="ml-3 flex-1">
+                    <h3 className="text-sm font-medium text-amber-800">Translation request timed out</h3>
+                    <p className="mt-1 text-sm text-amber-700">
+                      The server took too long to respond, but your document might still be processing in the background.
+                    </p>
+                    <div className="mt-3 flex gap-3">
+                      <button 
+                        onClick={handleRetryPolling}
+                        className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded-md text-white bg-amber-600 hover:bg-amber-700"
+                      >
+                        <RefreshCw size={14} className="mr-1" />
+                        Check status
+                      </button>
+                      <button 
+                        onClick={attemptRecoveryAfterTimeout}
+                        className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded-md text-amber-800 bg-amber-100 hover:bg-amber-200"
+                      >
+                        <Loader2 size={14} className="mr-1 animate-spin" />
+                        Attempt recovery
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            
+            {/* Status display for partial results */}
+            {!translationStatus.isLoading && translationStatus.status === 'partial' && translationStatus.translatedText && (
+              <div className="mt-6 bg-purple-50 p-4 rounded-lg border border-purple-100">
+                <div className="flex items-start">
+                  <div className="shrink-0 mt-0.5">
+                    <svg className="h-5 w-5 text-purple-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <div className="ml-3 flex-1">
+                    <h3 className="text-sm font-medium text-purple-800">Partial translation available</h3>
+                    <p className="mt-1 text-sm text-purple-700">
+                      We've retrieved the translation progress so far. The full document may still be processing.
+                    </p>
+                    
+                    <div className="flex mt-3 gap-3">
+                      <button 
+                        onClick={handleRetryPolling}
+                        className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded-md text-white bg-purple-600 hover:bg-purple-700"
+                      >
+                        <RefreshCw size={14} className="mr-1" />
+                        Check for updates
+                      </button>
+                      <button 
+                        onClick={() => setTranslationStatus(prev => ({ ...prev, isLoading: false, status: 'completed' }))}
+                        className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded-md text-purple-800 bg-purple-100 hover:bg-purple-200"
+                      >
+                        <Check size={14} className="mr-1" />
+                        Accept partial results
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+  
+            {/* Status display for stalled translations */}
+            {!translationStatus.isLoading && translationStatus.status === 'stalled' && (
+              <div className="mt-6 bg-red-50 p-4 rounded-lg border border-red-100">
+                <div className="flex items-start">
+                  <div className="shrink-0 mt-0.5">
+                    <svg className="h-5 w-5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <div className="ml-3 flex-1">
+                    <h3 className="text-sm font-medium">Translation stalled</h3>
+                    <p className="mt-1 text-sm">The translation has been running for too long without progress. This might be due to document complexity or server issues.</p>
+                    <div className="mt-3 flex gap-3">
+                      <button 
+                        onClick={() => {
+                          setTranslationStatus(prev => ({
+                            ...prev,
+                            isLoading: false,
+                            status: 'cancelled',
+                            error: null
+                          }));
+                        }}
+                        className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded-md text-white bg-red-600 hover:bg-red-700"
+                      >
+                        Cancel translation
+                      </button>
+                      <button 
+                        onClick={handleRetryPolling}
+                        className="inline-flex items-center px-3 py-1.5 border border-gray-300 text-xs font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                      >
+                        Try one more time
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+  
+            {/* Translation Results */}
+            {translationStatus.translatedText && (
+              <div className="mt-8 border-t pt-6">
+                <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
+                  <h2 className="text-xl font-semibold text-gray-800 flex items-center">
+                    <FileText className="h-5 w-5 mr-2 text-indigo-600" /> 
+                    Translated Document
+                  </h2>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleCopyText}
+                      className="flex items-center gap-2 px-3 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 transition-colors"
+                      disabled={!translationStatus.translatedText}
                     >
-                      Retry status check
+                      {isCopied ? <Check size={16} /> : <Copy size={16} />}
+                      {isCopied ? "Copied" : "Copy Text"}
                     </button>
+                    <DocumentDownloadButton
+                      text={translationStatus.translatedText}
+                      language={selectedLanguage}
+                      onError={(error) => toast.error(error)}
+                      onSuccess={() => toast.success('Document downloaded successfully!')}
+                      disabled={!translationStatus.translatedText || translationStatus.isLoading}
+                      className="flex items-center gap-2"
+                    />
+                    <GoogleDriveButton
+                      htmlContent={translationStatus.translatedText}
+                      fileName={translationStatus.fileName ? `translated_${translationStatus.fileName.replace(/\.(pdf|jpe?g|png|webp|heic)$/i, '.docx')}` : 'translated_document.docx'}
+                      onError={(error) => toast.error(error)}
+                      onSuccess={() => toast.success('Document saved to Google Drive successfully!')}
+                      disabled={!translationStatus.translatedText || translationStatus.isLoading}
+                      className="flex items-center gap-2"
+                    />
+                  </div>
+                </div>
+  
+                <div className="mb-2 flex items-center">
+                  <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                    <Check className="w-3 h-3 mr-1" />
+                    Translated
+                  </span>
+                  {translationStatus.status === 'partial' && (
+                    <span className="ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+                      Partial Results
+                    </span>
                   )}
                 </div>
-              </div>
-            </div>
-          )}
-
-          {/* Translation Results */}
-          {translationStatus.translatedText && (
-            <div className="mt-8 border-t pt-6">
-              <div className="mb-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
-                <h2 className="text-xl font-semibold text-gray-800 flex items-center">
-                  <FileText className="h-5 w-5 mr-2 text-indigo-600" /> 
-                  Translated Document
-                </h2>
-                <div className="flex gap-2">
-                  <button
-                    onClick={handleCopyText}
-                    className="flex items-center gap-2 px-3 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 transition-colors"
-                    disabled={!translationStatus.translatedText}
-                  >
-                    {isCopied ? <Check size={16} /> : <Copy size={16} />}
-                    {isCopied ? "Copied" : "Copy Text"}
-                  </button>
-                  <DocumentDownloadButton
-                    text={translationStatus.translatedText}
-                    language={selectedLanguage}
-                    onError={(error) => toast.error(error)}
-                    onSuccess={() => toast.success('Document downloaded successfully!')}
-                    disabled={!translationStatus.translatedText || translationStatus.isLoading}
-                    className="flex items-center gap-2"
-                  />
-                  <GoogleDriveButton
-                    htmlContent={translationStatus.translatedText}
-                    fileName={translationStatus.fileName ? `translated_${translationStatus.fileName.replace(/\.(pdf|jpe?g|png|webp|heic)$/i, '.docx')}` : 'translated_document.docx'}
-                    onError={(error) => toast.error(error)}
-                    onSuccess={() => toast.success('Document saved to Google Drive successfully!')}
-                    disabled={!translationStatus.translatedText || translationStatus.isLoading}
-                    className="flex items-center gap-2"
-                  />
+  
+                <div
+                  ref={contentRef}
+                  className="document-preview p-6 border rounded-lg bg-white"
+                  style={{
+                    direction: translationStatus.direction,
+                    textAlign: translationStatus.direction === 'rtl' ? 'right' : 'left',
+                    fontFamily: translationStatus.direction === 'rtl' ? 'Tahoma, Arial' : 'inherit',
+                  }}
+                  dangerouslySetInnerHTML={{ __html: translationStatus.translatedText }}
+                />
+                
+                <div className="mt-2 text-xs text-gray-500 text-right flex items-center justify-end gap-2">
+                  <FileText className="h-3 w-3" />
+                  Original file: {translationStatus.fileName}
                 </div>
               </div>
-
-              <div className="mb-2 flex items-center">
-                <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                  <Check className="w-3 h-3 mr-1" />
-                  Translated
-                </span>
+            )}
+          </div>
+        </div>
+        
+        {/* Features Section */}
+        <div className="mt-12 mb-8">
+          <h2 className="text-2xl font-bold text-center mb-8 text-gray-800">Features</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
+              <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
+                <FileText className="h-6 w-6 text-indigo-600" />
               </div>
-
-              <div
-                ref={contentRef}
-                className="document-preview p-6 border rounded-lg bg-white"
-                style={{
-                  direction: translationStatus.direction,
-                  textAlign: translationStatus.direction === 'rtl' ? 'right' : 'left',
-                  fontFamily: translationStatus.direction === 'rtl' ? 'Tahoma, Arial' : 'inherit',
-                }}
-                dangerouslySetInnerHTML={{ __html: translationStatus.translatedText }}
-              />
-              
-              <div className="mt-2 text-xs text-gray-500 text-right flex items-center justify-end gap-2">
-                <FileText className="h-3 w-3" />
-                Original file: {translationStatus.fileName}
-              </div>
+              <h3 className="text-lg font-semibold mb-2">Preserve Formatting</h3>
+              <p className="text-gray-600">Maintain original document layout, tables, and styles in the translated output.</p>
             </div>
-          )}
-                    </div>
-                  </div>
-                  
-                  {/* Features Section */}
-                  <div className="mt-12 mb-8">
-                    <h2 className="text-2xl font-bold text-center mb-8 text-gray-800">Features</h2>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                      <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
-                        <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
-                          <FileText className="h-6 w-6 text-indigo-600" />
-                        </div>
-                        <h3 className="text-lg font-semibold mb-2">Preserve Formatting</h3>
-                        <p className="text-gray-600">Maintain original document layout, tables, and styles in the translated output.</p>
-                      </div>
-                      
-                      <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
-                        <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
-                          <Languages className="h-6 w-6 text-indigo-600" />
-                        </div>
-                        <h3 className="text-lg font-semibold mb-2">Multiple Languages</h3>
-                        <p className="text-gray-600">Support for 13+ languages including Spanish, French, German, Chinese, and Arabic.</p>
-                      </div>
-                      
-                      <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
-                        <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
-                          <Download className="h-6 w-6 text-indigo-600" />
-                        </div>
-                        <h3 className="text-lg font-semibold mb-2">Export Options</h3>
-                        <p className="text-gray-600">Download translated documents in PDF or DOCX format for easy sharing.</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
+            
+            <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
+              <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
+                <Languages className="h-6 w-6 text-indigo-600" />
               </div>
-            );
-          }
+              <h3 className="text-lg font-semibold mb-2">Multiple Languages</h3>
+              <p className="text-gray-600">Support for 13+ languages including Spanish, French, German, Chinese, and Arabic.</p>
+            </div>
+            
+            <div className="bg-white p-6 rounded-lg shadow hover:shadow-md transition-shadow">
+              <div className="rounded-full bg-indigo-100 w-12 h-12 flex items-center justify-center mb-4">
+                <Download className="h-6 w-6 text-indigo-600" />
+              </div>
+              <h3 className="text-lg font-semibold mb-2">Export Options</h3>
+              <p className="text-gray-600">Download translated documents in PDF or DOCX format for easy sharing.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -265,8 +265,39 @@ export const documentService = {
     console.log(`🔄 [${new Date().toISOString()}] Initiating document translation...`);
     
     try {
-      const response = await api.post('/documents/translate', formData, {
+      // Create a new FormData object to handle file data properly
+      const newFormData = new FormData();
+      
+      // Get file from original FormData
+      const file = formData.get('file');
+      const fromLang = formData.get('from_lang');
+      const toLang = formData.get('to_lang');
+      
+      // Add file size logging
+      if (file) {
+        console.log(`📄 File size: ${(file.size / (1024 * 1024)).toFixed(2)}MB, Type: ${file.type}`);
+      }
+      
+      // If file is large (> 5MB), add a note about potential longer processing time
+      if (file && file.size > 5 * 1024 * 1024) {
+        console.log(`⚠️ Large file detected (${(file.size / (1024 * 1024)).toFixed(2)}MB). Processing may take longer.`);
+      }
+      
+      // Add all fields to the new FormData
+      newFormData.append('file', file);
+      newFormData.append('from_lang', fromLang);
+      newFormData.append('to_lang', toLang);
+      
+      // Use longer timeout for large files
+      const requestTimeout = file && file.size > 10 * 1024 * 1024 ? 90000 : 60000; // 90 seconds for large files
+      
+      const response = await api.post('/documents/translate', newFormData, {
         headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: requestTimeout,
+        onUploadProgress: (progressEvent) => {
+          const uploadPercentage = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          console.log(`📤 Upload progress: ${uploadPercentage}%`);
+        }
       });
       
       const duration = Date.now() - startTime;
@@ -279,7 +310,8 @@ export const documentService = {
           status: response.data.status || 'pending',
           progress: 0,
           currentPage: 0,
-          totalPages: 0
+          totalPages: 0,
+          estimatedTimeSeconds: response.data.estimatedTimeSeconds
         });
       }
       
@@ -312,8 +344,17 @@ export const documentService = {
         }
       }
       
+      // Better timeout message
       if (error.code === 'ECONNABORTED') {
-        throw new Error('Request timed out. Please try again with a smaller file.');
+        // This could mean the upload succeeded but the response timed out
+        // In this case, we should try to check if a process was created
+        console.log(`⏳ Upload request timed out, but the server might still be processing it`);
+        
+        throw new Error(
+          'The server is taking longer than expected to respond. ' +
+          'Your file might be processing in the background. ' +
+          'You can try checking the status in a few moments.'
+        );
       }
       
       throw new Error('Failed to initiate translation. Please try again later.');
@@ -605,6 +646,100 @@ export const documentService = {
       console.error('❌ Export to Google Drive as DOCX failed:', error);
       throw error;
     }
+  },
+
+  getTranslationResult: async (processId, allowPartial = false) => {
+    // Deduplicate concurrent result fetches for the same processId
+    const requestKey = `result-${processId}-${allowPartial ? 'partial' : 'complete'}`;
+    
+    // If there's already an active request for this processId, return its promise
+    if (documentService._activeRequests.has(requestKey)) {
+      console.log(`⏳ [${new Date().toISOString()}] Reusing existing result fetch for process: ${processId}`);
+      return documentService._activeRequests.get(requestKey);
+    }
+    
+    // Create an AbortController for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15-second timeout for results
+    
+    const startTime = Date.now();
+    console.log(`🔄 [${new Date().toISOString()}] Fetching translation result for process: ${processId} (partial=${allowPartial})`);
+    
+    // Create the promise for this request
+    const requestPromise = (async () => {
+      try {
+        const url = allowPartial 
+          ? `documents/result/${processId}?partial=true` 
+          : `documents/result/${processId}`;
+        
+        const response = await api.get(url, {
+          signal: controller.signal,
+          timeout: 15000
+        });
+        
+        // Clear timeout
+        clearTimeout(timeoutId);
+        
+        const duration = Date.now() - startTime;
+        console.log(`✅ [${new Date().toISOString()}] Translation result fetched successfully in ${duration}ms, content length: ${response.data.translatedText?.length || 0} chars`);
+        
+        // Update status to completed in our cache
+        documentService._updateLastKnownStatus(processId, {
+          processId: processId,
+          status: allowPartial ? 'partial' : 'completed',
+          progress: allowPartial ? Math.min(95, response.data.metadata?.progress || 0) : 100,
+          currentPage: response.data.metadata?.currentPage || 0,
+          totalPages: response.data.metadata?.totalPages || 0
+        });
+        
+        return response.data;
+      } catch (error) {
+        // Clear timeout
+        clearTimeout(timeoutId);
+        
+        const duration = Date.now() - startTime;
+        console.error(`❌ [${new Date().toISOString()}] Result fetch failed after ${duration}ms:`, error);
+        
+        // Handle timeouts
+        if (
+          error.name === 'AbortError' || 
+          error.code === 'ECONNABORTED' || 
+          error.message.includes('timeout')
+        ) {
+          throw new Error('Request timed out while fetching translation results. The server might be busy processing a large document. Please try again in a moment.');
+        }
+        
+        // Handle authentication errors
+        if (error.response && error.response.status === 401) {
+          try {
+            return await documentService._handleAuthError(
+              error, 
+              'result', 
+              () => api.get(allowPartial ? `documents/result/${processId}?partial=true` : `documents/result/${processId}`)
+            ).then(response => response.data);
+          } catch (retryError) {
+            // If retry fails, continue with normal error handling
+          }
+        }
+        
+        // Enhanced error handling with specific error messages
+        if (error.response?.status === 404) {
+          throw new Error('Translation not found. The process may have expired.');
+        } else if (error.response?.status === 400) {
+          throw new Error('Translation is not yet complete. Please wait until it finishes processing.');
+        }
+        
+        throw new Error('Failed to fetch translation result. Please try again later.');
+      } finally {
+        // Remove this request from the active requests map
+        documentService._activeRequests.delete(requestKey);
+      }
+    })();
+    
+    // Store the promise in the active requests map
+    documentService._activeRequests.set(requestKey, requestPromise);
+    
+    return requestPromise;
   }
 };
 
