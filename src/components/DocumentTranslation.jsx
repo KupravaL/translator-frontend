@@ -18,7 +18,13 @@ export default function DocumentTranslationPage() {
   const lastStatusRef = useRef(null);
   const statusUpdateIntervalRef = useRef(null);
   const forcedProgressRef = useRef(null);
+  const [processStartTime, setProcessStartTime] = useState(null);
   
+  const getProcessRuntime = useCallback(() => {
+    if (!processStartTime) return 0;
+    return Math.floor((Date.now() - processStartTime) / 1000);
+  }, [processStartTime]);
+
   // Keep track of status check issues
   const [consecFailures, setConsecFailures] = useState(0);
   const [lastFallbackStatus, setLastFallbackStatus] = useState(false);
@@ -229,7 +235,7 @@ export default function DocumentTranslationPage() {
     
     // Keep track of how long this process has been active
     const processStartTime = translationStatus.processStartTime || Date.now();
-    const processRuntime = (Date.now() - processStartTime) / 1000; // in seconds
+    const processRuntime = getProcessRuntime();
     
     try {
       const statusData = await documentService.checkTranslationStatus(processId);
@@ -424,7 +430,7 @@ export default function DocumentTranslationPage() {
       toast.error('A translation is already in progress.');
       return;
     }
-  
+    setProcessStartTime(Date.now());
     setSelectedLanguage(toLang);
     
     // Store file info for potential retry
