@@ -298,22 +298,25 @@ export default function DocumentTranslationPage() {
   }, [translationStatus, consecFailures, getPollInterval]);
   
 
-  // Effect to start polling whenever processId changes
   useEffect(() => {
     if (translationStatus.processId && translationStatus.isLoading) {
+      console.log("Starting polling for process ID:", translationStatus.processId);
+      
       // Reset polling attempt counter
       pollAttemptRef.current = 0;
       
-      // Start polling with small initial delay
-      statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 500);
+      // Start polling immediately
+      pollTranslationStatus();
       
       return () => {
         if (statusCheckTimeoutRef.current) {
           clearTimeout(statusCheckTimeoutRef.current);
         }
       };
+    } else {
+      console.log("Not starting polling. processId:", translationStatus.processId, "isLoading:", translationStatus.isLoading);
     }
-  }, [translationStatus.processId, translationStatus.isLoading, pollTranslationStatus]);
+  }, [translationStatus.processId, translationStatus.isLoading]);
   
   // Effect to detect completely stuck translations
   useEffect(() => {
@@ -400,41 +403,44 @@ export default function DocumentTranslationPage() {
     });
   
     try {
-      // Prepare form data for upload
+      // Initiate translation process
       const formData = new FormData();
       formData.append('file', file);
       formData.append('from_lang', fromLang);
       formData.append('to_lang', toLang);
   
-      // Show notification for large files
-      if (file.size > 5 * 1024 * 1024) {
-        toast.info(
-          `This is a large file (${(file.size / (1024 * 1024)).toFixed(2)}MB). ` +
-          `The translation may take several minutes.`,
-          { duration: 5000 }
-        );
-      }
-  
-      // Initiate translation process
+      console.log("Starting translation request...");
       const response = await documentService.initiateTranslation(formData);
+      
+      console.log("Translation initiated response:", response);
       
       if (!response.processId) {
         throw new Error('No process ID received from the server');
       }
       
-      // Update state with process ID
+      // Update state with process ID - ensure isLoading is true
       setTranslationStatus(prev => ({
         ...prev,
         processId: response.processId,
         status: response.status || 'pending',
-        lastStatusUpdate: Date.now(),
-        estimatedTimeSeconds: response.estimatedTimeSeconds
+        isLoading: true, // Ensure this is true to trigger polling
+        lastStatusUpdate: Date.now()
       }));
+      
+      // Log the process ID to confirm it's set
+      console.log("Process ID set:", response.processId);
       
       toast.success('Translation started successfully');
       
+      // For extra safety, manually trigger the first poll after a short delay
+      setTimeout(() => {
+        console.log("Manually triggering first poll...");
+        pollTranslationStatus();
+      }, 1000);
+      
       // Polling will start automatically via the useEffect
       
+    
     } catch (error) {
       console.error('Translation initiation error:', error);
       
@@ -470,70 +476,61 @@ export default function DocumentTranslationPage() {
     }
   };
 
-  // Add function to attempt recovery after timeout
-  const attemptRecoveryAfterTimeout = async () => {
-    // Get file info from state
-    const { fileInfo } = translationStatus;
+// Fix for the recovery attempt function
+const attemptRecoveryAfterTimeout = async () => {
+  // Get the last known processId from the translationStatus
+  const { processId, fileInfo } = translationStatus;
+  
+  if (!processId) {
+    toast.error("Cannot recover: missing process ID");
+    return;
+  }
+  
+  // Show recovery in progress
+  toast.info("Attempting to recover translation status...");
+  
+  // Update UI to show we're checking
+  setTranslationStatus(prev => ({
+    ...prev,
+    isLoading: true,
+    status: 'checking',
+    error: null,
+    lastStatusUpdate: Date.now()
+  }));
+  
+  try {
+    // Use the actual process ID we already have
+    console.log("Attempting recovery with process ID:", processId);
     
-    if (!fileInfo) {
-      toast.error("Cannot recover: missing file information");
-      return;
-    }
+    // Try checking the status of the existing process ID
+    const statusData = await documentService.checkTranslationStatus(processId);
     
-    // Show recovery in progress
-    toast.info("Attempting to recover translation status...");
-    
-    // Update UI to show we're checking
+    // If we get here, the process exists and we can update the status
     setTranslationStatus(prev => ({
       ...prev,
-      isLoading: true,
-      status: 'checking',
-      error: null,
+      status: statusData.status || 'in_progress',
+      progress: statusData.progress || 0,
+      currentPage: statusData.currentPage || 0,
+      totalPages: statusData.totalPages || 0,
       lastStatusUpdate: Date.now()
     }));
     
-    try {
-      // Generate a fake process ID based on file properties to check if we can find it
-      // This is just a heuristic approach - the backend should have a more reliable way
-      const possibleProcessId = `${fileInfo.name.slice(0, 8)}-${Date.now().toString().slice(-8)}`;
-      
-      // Try checking if there's any recent translation with this file name
-      toast.info("Checking for recent translations...");
-      
-      // Set simulated progress to show activity
-      setSimulatedProgress({
-        active: true,
-        value: 10,
-        page: 1,
-        total: fileInfo.type.includes('pdf') ? Math.max(1, Math.floor(fileInfo.size / (100 * 1024))) : 1
-      });
-      
-      // If we find a process, update state and start polling
-      const fakeProcessId = possibleProcessId;
-      setTranslationStatus(prev => ({
-        ...prev,
-        processId: fakeProcessId,
-        status: 'in_progress',
-        progress: 10, // Assume some progress
-        lastStatusUpdate: Date.now()
-      }));
-      
-      // Start polling for this process ID
-      pollTranslationStatus();
-      
-      toast.success("Recovery attempt initiated. Checking status...");
-    } catch (error) {
-      console.error("Recovery attempt failed:", error);
-      toast.error("Could not recover the translation. Please try again.");
-      
-      setTranslationStatus(prev => ({
-        ...prev,
-        isLoading: false,
-        status: 'failed',
-        error: "Recovery attempt failed. Please try uploading the file again."
-      }));
-    }
-  };
+    // Start polling immediately
+    pollTranslationStatus();
+    
+    toast.success("Recovery successful! Translation status updated.");
+  } catch (error) {
+    console.error("Recovery attempt failed:", error);
+    toast.error("Could not recover the translation. Please try again.");
+    
+    setTranslationStatus(prev => ({
+      ...prev,
+      isLoading: false,
+      status: 'failed',
+      error: "Recovery attempt failed. Please try uploading the file again."
+    }));
+  }
+};
 
 // Improved fetchTranslationResults function with partial result handling
 const fetchTranslationResults = async (processId) => {
