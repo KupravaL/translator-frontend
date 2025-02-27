@@ -260,59 +260,75 @@ export const documentService = {
     });
   },
   
+
+  // List active translations
+  listActiveTranslations: async () => {
+    try {
+      console.log("🔄 Fetching active translations...");
+      const response = await api.get('/documents/active');
+      console.log("✅ Retrieved active translations:", response.data.translations.length);
+      return response.data.translations;
+    } catch (error) {
+      console.error("❌ Failed to fetch active translations:", error);
+      return [];
+    }
+  },
+
+  // Find translation by file name
+  findTranslationByFile: async (fileName) => {
+    try {
+      console.log(`🔄 Searching for translation of file: ${fileName}`);
+      const response = await api.get(`/documents/find?file_name=${encodeURIComponent(fileName)}`);
+      console.log("✅ Found translation:", response.data);
+      return response.data;
+    } catch (error) {
+      if (error.response && error.response.status === 404) {
+        console.log("⚠️ No translation found for file:", fileName);
+        return null;
+      }
+      console.error("❌ Error finding translation:", error);
+      throw error;
+    }
+  },
+
+  // Update the initiateTranslation method to handle timeouts better
   initiateTranslation: async (formData) => {
     const startTime = Date.now();
     console.log(`🔄 [${new Date().toISOString()}] Initiating document translation...`);
     
+    // Extract file name for potential recovery
+    const file = formData.get('file');
+    const fileName = file ? file.name : 'unknown';
+    console.log(`📄 Starting translation for file: ${fileName}`);
+    
     try {
-      // Create a new FormData object to handle file data properly
-      const newFormData = new FormData();
-      
-      // Get file from original FormData
-      const file = formData.get('file');
-      const fromLang = formData.get('from_lang');
-      const toLang = formData.get('to_lang');
-      
-      // Add file size logging
-      if (file) {
-        console.log(`📄 File size: ${(file.size / (1024 * 1024)).toFixed(2)}MB, Type: ${file.type}`);
-      }
-      
-      // If file is large (> 5MB), add a note about potential longer processing time
-      if (file && file.size > 5 * 1024 * 1024) {
-        console.log(`⚠️ Large file detected (${(file.size / (1024 * 1024)).toFixed(2)}MB). Processing may take longer.`);
-      }
-      
-      // Add all fields to the new FormData
-      newFormData.append('file', file);
-      newFormData.append('from_lang', fromLang);
-      newFormData.append('to_lang', toLang);
-      
-      // Use longer timeout for large files
-      const requestTimeout = file && file.size > 10 * 1024 * 1024 ? 90000 : 60000; // 90 seconds for large files
-      
-      const response = await api.post('/documents/translate', newFormData, {
+      const response = await api.post('/documents/translate', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: requestTimeout,
-        onUploadProgress: (progressEvent) => {
-          const uploadPercentage = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-          console.log(`📤 Upload progress: ${uploadPercentage}%`);
-        }
+        timeout: 60000 // 60 seconds
       });
       
       const duration = Date.now() - startTime;
       console.log(`✅ [${new Date().toISOString()}] Translation initiated in ${duration}ms, received processId: ${response.data.processId}`);
       
-      // Initialize last known status
-      if (response.data.processId) {
-        documentService._updateLastKnownStatus(response.data.processId, {
+      // Store in local storage for recovery purposes
+      try {
+        const translationInfo = {
           processId: response.data.processId,
-          status: response.data.status || 'pending',
-          progress: 0,
-          currentPage: 0,
-          totalPages: 0,
-          estimatedTimeSeconds: response.data.estimatedTimeSeconds
-        });
+          fileName: fileName,
+          timestamp: Date.now(),
+          status: response.data.status || 'pending'
+        };
+        // Keep a history of recent translations for recovery
+        const recentTranslations = JSON.parse(localStorage.getItem('recentTranslations') || '[]');
+        recentTranslations.unshift(translationInfo); // Add to beginning
+        // Keep only last 10
+        if (recentTranslations.length > 10) {
+          recentTranslations.pop();
+        }
+        localStorage.setItem('recentTranslations', JSON.stringify(recentTranslations));
+        console.log("📦 Saved translation info to local storage for recovery");
+      } catch (storageError) {
+        console.warn("⚠️ Failed to save to local storage:", storageError);
       }
       
       return response.data;
@@ -320,35 +336,30 @@ export const documentService = {
       const duration = Date.now() - startTime;
       console.error(`❌ [${new Date().toISOString()}] Translation initiation failed after ${duration}ms:`, error);
       
-      // Handle authentication errors
-      if (error.response && error.response.status === 401) {
-        try {
-          return await documentService._handleAuthError(
-            error, 
-            'translate', 
-            () => documentService.initiateTranslation(formData)
-          );
-        } catch (retryError) {
-          // If retry fails, continue with normal error handling
-        }
-      }
-      
-      // Enhanced error handling with specific error messages
-      if (error.response) {
-        if (error.response.status === 413) {
-          throw new Error('File is too large. Maximum size is 20MB.');
-        }
+      // For timeouts, try to recover immediately
+      if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+        console.log("⏳ Upload request timed out, but the server might still be processing it");
         
-        if (error.response.data && error.response.data.error) {
-          throw new Error(error.response.data.error);
+        // First try to find the translation using the backend API
+        try {
+          // Give the server a moment to create the record
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          const foundTranslation = await documentService.findTranslationByFile(fileName);
+          if (foundTranslation) {
+            console.log("🔍 Found translation after timeout:", foundTranslation.processId);
+            // Return the found translation
+            return {
+              success: true,
+              message: "Translation process found after timeout",
+              processId: foundTranslation.processId,
+              status: foundTranslation.status,
+              recoveredAfterTimeout: true
+            };
+          }
+        } catch (recoveryError) {
+          console.warn("⚠️ Failed to recover translation after timeout:", recoveryError);
         }
-      }
-      
-      // Better timeout message
-      if (error.code === 'ECONNABORTED') {
-        // This could mean the upload succeeded but the response timed out
-        // In this case, we should try to check if a process was created
-        console.log(`⏳ Upload request timed out, but the server might still be processing it`);
         
         throw new Error(
           'The server is taking longer than expected to respond. ' +
@@ -357,7 +368,7 @@ export const documentService = {
         );
       }
       
-      throw new Error('Failed to initiate translation. Please try again later.');
+      throw error;
     }
   },
   

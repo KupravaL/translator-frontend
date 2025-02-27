@@ -350,29 +350,31 @@ export default function DocumentTranslationPage() {
     return () => clearInterval(checkStuckInterval);
   }, [translationStatus.isLoading, translationStatus.lastStatusUpdate, pollTranslationStatus]);
 
+// Improved onTranslate function with better timeout handling
   const onTranslate = async (file, fromLang, toLang) => {
     if (!file) {
       toast.error('Please upload a file before translating.');
       return;
     }
-  
+
     if (!fromLang || !toLang) {
       toast.error('Please select both source and target languages.');
       return;
     }
-  
+
     if (translationStatus.isLoading) {
       toast.error('A translation is already in progress.');
       return;
     }
-    setProcessStartTime(Date.now());
+
     setSelectedLanguage(toLang);
     
-    // Store file info for potential retry
+    // Store file info for potential recovery
     const fileInfo = {
       name: file.name,
       size: file.size,
-      type: file.type
+      type: file.type,
+      uploadTime: Date.now()
     };
     
     // Reset status tracking
@@ -385,6 +387,9 @@ export default function DocumentTranslationPage() {
       page: 0,
       total: file.type.includes('pdf') ? Math.max(1, Math.floor(file.size / (100 * 1024))) : 1
     });
+    
+    // Set process start time for runtime tracking
+    setProcessStartTime(Date.now());
     
     // Update status to pending
     setTranslationStatus({
@@ -401,46 +406,47 @@ export default function DocumentTranslationPage() {
       lastStatusUpdate: Date.now(),
       fileInfo: fileInfo
     });
-  
+
     try {
-      // Initiate translation process
+      // Prepare form data for upload
       const formData = new FormData();
       formData.append('file', file);
       formData.append('from_lang', fromLang);
       formData.append('to_lang', toLang);
-  
-      console.log("Starting translation request...");
+
+      // Show notification for large files
+      if (file.size > 5 * 1024 * 1024) {
+        toast.info(
+          `This is a large file (${(file.size / (1024 * 1024)).toFixed(2)}MB). ` +
+          `The translation may take several minutes.`,
+          { duration: 5000 }
+        );
+      }
+
+      // Initiate translation process
       const response = await documentService.initiateTranslation(formData);
       
-      console.log("Translation initiated response:", response);
+      // Check if response indicates it was recovered after timeout
+      if (response.recoveredAfterTimeout) {
+        toast.success('Translation was found after timeout! Continuing to monitor progress...');
+      } else {
+        toast.success('Translation started successfully');
+      }
       
       if (!response.processId) {
         throw new Error('No process ID received from the server');
       }
       
-      // Update state with process ID - ensure isLoading is true
+      // Update state with process ID
       setTranslationStatus(prev => ({
         ...prev,
         processId: response.processId,
         status: response.status || 'pending',
-        isLoading: true, // Ensure this is true to trigger polling
         lastStatusUpdate: Date.now()
       }));
       
-      // Log the process ID to confirm it's set
-      console.log("Process ID set:", response.processId);
-      
-      toast.success('Translation started successfully');
-      
-      // For extra safety, manually trigger the first poll after a short delay
-      setTimeout(() => {
-        console.log("Manually triggering first poll...");
-        pollTranslationStatus();
-      }, 1000);
-      
       // Polling will start automatically via the useEffect
       
-    
     } catch (error) {
       console.error('Translation initiation error:', error);
       
@@ -455,7 +461,7 @@ export default function DocumentTranslationPage() {
           { duration: 8000 }
         );
         
-        // If we have a file reference, offer retry option
+        // Check if we can get active translations to find our process
         setTranslationStatus(prev => ({
           ...prev,
           isLoading: false,
@@ -463,6 +469,12 @@ export default function DocumentTranslationPage() {
           error: 'The server timed out while processing the request. Your document might still be processing in the background.',
           canRetryCheck: true
         }));
+        
+        // Try to find the translation automatically after a moment
+        setTimeout(() => {
+          attemptRecoveryAfterTimeout();
+        }, 3000);
+        
       } else {
         // Normal error handling
         setTranslationStatus(prev => ({
@@ -476,180 +488,294 @@ export default function DocumentTranslationPage() {
     }
   };
 
-// Fix for the recovery attempt function
-const attemptRecoveryAfterTimeout = async () => {
-  // Get the last known processId from the translationStatus
-  const { processId, fileInfo } = translationStatus;
-  
-  if (!processId) {
-    toast.error("Cannot recover: missing process ID");
-    return;
-  }
-  
-  // Show recovery in progress
-  toast.info("Attempting to recover translation status...");
-  
-  // Update UI to show we're checking
-  setTranslationStatus(prev => ({
-    ...prev,
-    isLoading: true,
-    status: 'checking',
-    error: null,
-    lastStatusUpdate: Date.now()
-  }));
-  
-  try {
-    // Use the actual process ID we already have
-    console.log("Attempting recovery with process ID:", processId);
+  // Improved recovery function that uses the backend API
+  const attemptRecoveryAfterTimeout = async () => {
+    const { fileInfo } = translationStatus;
     
-    // Try checking the status of the existing process ID
-    const statusData = await documentService.checkTranslationStatus(processId);
-    
-    // If we get here, the process exists and we can update the status
-    setTranslationStatus(prev => ({
-      ...prev,
-      status: statusData.status || 'in_progress',
-      progress: statusData.progress || 0,
-      currentPage: statusData.currentPage || 0,
-      totalPages: statusData.totalPages || 0,
-      lastStatusUpdate: Date.now()
-    }));
-    
-    // Start polling immediately
-    pollTranslationStatus();
-    
-    toast.success("Recovery successful! Translation status updated.");
-  } catch (error) {
-    console.error("Recovery attempt failed:", error);
-    toast.error("Could not recover the translation. Please try again.");
-    
-    setTranslationStatus(prev => ({
-      ...prev,
-      isLoading: false,
-      status: 'failed',
-      error: "Recovery attempt failed. Please try uploading the file again."
-    }));
-  }
-};
-
-// Improved fetchTranslationResults function with partial result handling
-const fetchTranslationResults = async (processId) => {
-  try {
-    // First try with normal request
-    const resultResponse = await documentService.getTranslationResult(processId);
-    
-    setTranslationStatus({
-      isLoading: false,
-      progress: 100,
-      status: 'completed',
-      error: null,
-      translatedText: resultResponse.translatedText,
-      fileName: resultResponse.metadata.originalFileName,
-      direction: resultResponse.direction,
-      processId: processId,
-      currentPage: resultResponse.metadata.currentPage || 0,
-      totalPages: resultResponse.metadata.totalPages || 0,
-      lastStatusUpdate: Date.now()
-    });
-    
-    // Stop simulated progress
-    if (simulatedProgress.active) {
-      setSimulatedProgress({
-        active: false,
-        value: 0,
-        page: 0,
-        total: 0
-      });
-      
-      if (forcedProgressRef.current) {
-        clearInterval(forcedProgressRef.current);
-        forcedProgressRef.current = null;
-      }
+    if (!fileInfo) {
+      toast.error("Cannot recover: missing file information");
+      return;
     }
     
-    toast.success('Translation completed!');
+    // Show recovery in progress
+    toast.info("Attempting to recover translation status...");
     
-  } catch (error) {
-    console.error('Result fetch error:', error);
+    // Update UI to show we're checking
+    setTranslationStatus(prev => ({
+      ...prev,
+      isLoading: true,
+      status: 'checking',
+      error: null,
+      lastStatusUpdate: Date.now()
+    }));
     
-    // Try fetching partial results if available
-    if (error.message && (
-        error.message.includes('not completed') || 
-        error.response?.status === 400
-    )) {
-      console.log('Translation not complete yet, trying to fetch partial results...');
+    try {
+      // First, try to find by file name
+      const foundTranslation = await documentService.findTranslationByFile(fileInfo.name);
       
-      try {
-        // Add partial=true parameter to get whatever is ready
-        const partialResponse = await documentService.getTranslationResult(processId, true);
+      if (foundTranslation) {
+        console.log("Successfully found translation process:", foundTranslation);
         
-        if (partialResponse && partialResponse.translatedText) {
-          setTranslationStatus({
-            isLoading: false,
-            progress: Math.min(100, translationStatus.progress || 0),
-            status: 'partial',
-            partialResults: true,
-            error: null,
-            translatedText: partialResponse.translatedText,
-            fileName: partialResponse.metadata.originalFileName,
-            direction: partialResponse.direction,
-            processId: processId,
-            currentPage: partialResponse.metadata.currentPage || 0,
-            totalPages: partialResponse.metadata.totalPages || 0,
-            lastStatusUpdate: Date.now()
-          });
-          
-          toast.info('Partial translation results available', {
-            description: 'The translation is still in progress, but partial results are available.'
-          });
-          
-          return;
-        }
-      } catch (partialError) {
-        console.error('Failed to fetch partial results:', partialError);
+        setTranslationStatus(prev => ({
+          ...prev,
+          processId: foundTranslation.processId,
+          status: foundTranslation.status,
+          progress: foundTranslation.progress || 0,
+          currentPage: foundTranslation.currentPage || 0,
+          totalPages: foundTranslation.totalPages || 0,
+          isLoading: true,
+          lastStatusUpdate: Date.now()
+        }));
+        
+        // Start polling immediately
+        pollTranslationStatus();
+        
+        toast.success("Recovery successful! Translation found and status updated.");
+        return;
       }
       
-      // If partial results fetch fails, continue polling
-      console.log('Translation not yet complete, continuing to poll...');
-      // Reset status to in_progress and continue polling
-      setTranslationStatus(prev => ({
-        ...prev,
-        status: 'in_progress',
-        lastStatusUpdate: Date.now()
-      }));
+      // If we couldn't find by file name, try the active translations list
+      const activeTranslations = await documentService.listActiveTranslations();
       
-      // Resume polling after a short delay
-      statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 2000);
-    } else if (error.response && error.response.status === 401) {
-      // Authentication error - retry after a moment
-      console.log('Authentication error when fetching results, retrying shortly...');
+      // Find a recent translation within the last few minutes
+      const recentTime = fileInfo.uploadTime - (10 * 60 * 1000); // 10 minutes ago
+      const matchingTranslation = activeTranslations.find(t => {
+        const createdTime = new Date(t.createdAt).getTime();
+        return createdTime > recentTime;
+      });
       
-      setTimeout(async () => {
-        try {
-          await fetchTranslationResults(processId);
-        } catch (retryError) {
-          console.error('Failed to fetch results on retry:', retryError);
-          setTranslationStatus(prev => ({
-            ...prev,
-            isLoading: false,
-            status: 'failed',
-            error: 'Authentication error when fetching results. Please try again.',
-          }));
-          toast.error('Authentication error');
+      if (matchingTranslation) {
+        console.log("Found a recent translation that might match:", matchingTranslation);
+        
+        setTranslationStatus(prev => ({
+          ...prev,
+          processId: matchingTranslation.processId,
+          status: matchingTranslation.status,
+          progress: matchingTranslation.progress || 0,
+          currentPage: matchingTranslation.currentPage || 0,
+          totalPages: matchingTranslation.totalPages || 0,
+          isLoading: true,
+          lastStatusUpdate: Date.now()
+        }));
+        
+        // Start polling
+        pollTranslationStatus();
+        
+        toast.success("Found a recent translation! Monitoring progress...");
+        return;
+      }
+      
+      // Finally, check local storage for recent translations
+      try {
+        const recentTranslations = JSON.parse(localStorage.getItem('recentTranslations') || '[]');
+        
+        // Find a matching translation by file name
+        const savedTranslation = recentTranslations.find(t => t.fileName === fileInfo.name);
+        
+        if (savedTranslation && savedTranslation.processId) {
+          console.log("Found translation in local storage:", savedTranslation);
+          
+          // Verify it's valid by checking its status
+          try {
+            const statusData = await documentService.checkTranslationStatus(savedTranslation.processId);
+            
+            setTranslationStatus(prev => ({
+              ...prev,
+              processId: savedTranslation.processId,
+              status: statusData.status,
+              progress: statusData.progress || 0,
+              currentPage: statusData.currentPage || 0,
+              totalPages: statusData.totalPages || 0,
+              isLoading: true,
+              lastStatusUpdate: Date.now()
+            }));
+            
+            // Start polling
+            pollTranslationStatus();
+            
+            toast.success("Recovered translation from local cache!");
+            return;
+          } catch (statusError) {
+            console.log("Translation in local storage is no longer valid:", statusError);
+          }
         }
-      }, 2000);
-    } else {
-      // Otherwise, show the error
+      } catch (storageError) {
+        console.warn("Failed to check local storage:", storageError);
+      }
+      
+      // If all attempts failed, show an error
+      throw new Error("Could not find any active translation for this file");
+      
+    } catch (error) {
+      console.error("Recovery attempt failed:", error);
+      toast.error("Could not recover the translation. Please try again.");
+      
       setTranslationStatus(prev => ({
         ...prev,
         isLoading: false,
         status: 'failed',
-        error: error.message || 'Failed to fetch translation results',
+        error: "Recovery attempt failed. Please try uploading the file again."
       }));
-      toast.error(error.message || 'Failed to fetch translation results');
     }
-  }
-};
+  };
+
+  // Quick status check button handler
+  const handleCheckStatus = async () => {
+    const { fileInfo } = translationStatus;
+    
+    if (!fileInfo) {
+      toast.error("Cannot check status: missing file information");
+      return;
+    }
+    
+    toast.info("Checking translation status...");
+    
+    try {
+      const foundTranslation = await documentService.findTranslationByFile(fileInfo.name);
+      
+      if (foundTranslation) {
+        setTranslationStatus(prev => ({
+          ...prev,
+          processId: foundTranslation.processId,
+          status: foundTranslation.status,
+          progress: foundTranslation.progress || 0,
+          currentPage: foundTranslation.currentPage || 0,
+          totalPages: foundTranslation.totalPages || 0,
+          isLoading: true,
+          lastStatusUpdate: Date.now()
+        }));
+        
+        // Start polling
+        pollTranslationStatus();
+        
+        toast.success("Found your translation! Status updated.");
+      } else {
+        toast.warning("No translation found for this file.");
+      }
+    } catch (error) {
+      console.error("Status check failed:", error);
+      toast.error("Failed to check translation status.");
+    }
+  };
+
+  // Improved fetchTranslationResults function with partial result handling
+  const fetchTranslationResults = async (processId) => {
+    try {
+      // First try with normal request
+      const resultResponse = await documentService.getTranslationResult(processId);
+      
+      setTranslationStatus({
+        isLoading: false,
+        progress: 100,
+        status: 'completed',
+        error: null,
+        translatedText: resultResponse.translatedText,
+        fileName: resultResponse.metadata.originalFileName,
+        direction: resultResponse.direction,
+        processId: processId,
+        currentPage: resultResponse.metadata.currentPage || 0,
+        totalPages: resultResponse.metadata.totalPages || 0,
+        lastStatusUpdate: Date.now()
+      });
+      
+      // Stop simulated progress
+      if (simulatedProgress.active) {
+        setSimulatedProgress({
+          active: false,
+          value: 0,
+          page: 0,
+          total: 0
+        });
+        
+        if (forcedProgressRef.current) {
+          clearInterval(forcedProgressRef.current);
+          forcedProgressRef.current = null;
+        }
+      }
+      
+      toast.success('Translation completed!');
+      
+    } catch (error) {
+      console.error('Result fetch error:', error);
+      
+      // Try fetching partial results if available
+      if (error.message && (
+          error.message.includes('not completed') || 
+          error.response?.status === 400
+      )) {
+        console.log('Translation not complete yet, trying to fetch partial results...');
+        
+        try {
+          // Add partial=true parameter to get whatever is ready
+          const partialResponse = await documentService.getTranslationResult(processId, true);
+          
+          if (partialResponse && partialResponse.translatedText) {
+            setTranslationStatus({
+              isLoading: false,
+              progress: Math.min(100, translationStatus.progress || 0),
+              status: 'partial',
+              partialResults: true,
+              error: null,
+              translatedText: partialResponse.translatedText,
+              fileName: partialResponse.metadata.originalFileName,
+              direction: partialResponse.direction,
+              processId: processId,
+              currentPage: partialResponse.metadata.currentPage || 0,
+              totalPages: partialResponse.metadata.totalPages || 0,
+              lastStatusUpdate: Date.now()
+            });
+            
+            toast.info('Partial translation results available', {
+              description: 'The translation is still in progress, but partial results are available.'
+            });
+            
+            return;
+          }
+        } catch (partialError) {
+          console.error('Failed to fetch partial results:', partialError);
+        }
+        
+        // If partial results fetch fails, continue polling
+        console.log('Translation not yet complete, continuing to poll...');
+        // Reset status to in_progress and continue polling
+        setTranslationStatus(prev => ({
+          ...prev,
+          status: 'in_progress',
+          lastStatusUpdate: Date.now()
+        }));
+        
+        // Resume polling after a short delay
+        statusCheckTimeoutRef.current = setTimeout(pollTranslationStatus, 2000);
+      } else if (error.response && error.response.status === 401) {
+        // Authentication error - retry after a moment
+        console.log('Authentication error when fetching results, retrying shortly...');
+        
+        setTimeout(async () => {
+          try {
+            await fetchTranslationResults(processId);
+          } catch (retryError) {
+            console.error('Failed to fetch results on retry:', retryError);
+            setTranslationStatus(prev => ({
+              ...prev,
+              isLoading: false,
+              status: 'failed',
+              error: 'Authentication error when fetching results. Please try again.',
+            }));
+            toast.error('Authentication error');
+          }
+        }, 2000);
+      } else {
+        // Otherwise, show the error
+        setTranslationStatus(prev => ({
+          ...prev,
+          isLoading: false,
+          status: 'failed',
+          error: error.message || 'Failed to fetch translation results',
+        }));
+        toast.error(error.message || 'Failed to fetch translation results');
+      }
+    }
+  };
   
   // Cancel translation function
   const handleCancel = () => {
@@ -1032,7 +1158,7 @@ const fetchTranslationResults = async (processId) => {
                     </p>
                     <div className="mt-3 flex gap-3">
                       <button 
-                        onClick={handleRetryPolling}
+                        onClick={handleCheckStatus}
                         className="inline-flex items-center px-3 py-1.5 border border-transparent text-xs font-medium rounded-md text-white bg-amber-600 hover:bg-amber-700"
                       >
                         <RefreshCw size={14} className="mr-1" />
