@@ -286,8 +286,8 @@ export default function DocumentTranslationPage() {
         : false;
       
       // If the process has been running for more than 30 minutes with the same progress for 10+ minutes, assume it's dead
-      if (processRuntime > 30 * 60 && noProgressTime) {
-        console.warn(`⚠️ Process appears to be dead - no progress for 10+ minutes and running for ${Math.floor(processRuntime/60)} minutes`);
+      if (getProcessRuntime() > 30 * 60 && noProgressTime) {
+        console.warn(`⚠️ Process appears to be dead - no progress for 10+ minutes and running for ${Math.floor(getProcessRuntime()/60)} minutes`);
         
         setTranslationStatus(prev => ({
           ...prev,
@@ -1018,19 +1018,19 @@ const fetchTranslationResults = async (processId) => {
                 </div>
                 
                 {/* Add warning for long-running translations */}
-                {processRuntime > 5 * 60 && (
+                {getProcessRuntime() > 5 * 60 && (
                   <div className="mt-3 text-xs bg-amber-50 p-2 rounded border border-amber-100 text-amber-800">
                     <p className="flex items-center">
                       <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                       </svg>
-                      This translation has been running for {Math.floor(processRuntime / 60)} minutes. Larger documents may take 10+ minutes to complete.
+                      This translation has been running for {Math.floor(getProcessRuntime() / 60)} minutes. Larger documents may take 10+ minutes to complete.
                     </p>
                   </div>
                 )}
   
                 {/* Add additional guidance if we've been stuck for a long time */}
-                {processRuntime > 15 * 60 && timeCounter > 120 && (
+                {getProcessRuntime() > 15 * 60 && timeCounter > 120 && (
                   <div className="mt-2 text-xs bg-amber-100 p-2 rounded border border-amber-200 text-amber-900">
                     <p className="flex items-center font-medium">
                       <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
