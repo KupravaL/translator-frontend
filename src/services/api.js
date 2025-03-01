@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { useAuth as useClerkAuth } from '@clerk/clerk-react';
 
