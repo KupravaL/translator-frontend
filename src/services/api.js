@@ -18,12 +18,53 @@ const api = axios.create({
 let authToken = null;
 let tokenExpiryTime = null;
 let requestInterceptorId = null;
+let responseInterceptorId = null;
+let isRefreshing = false;
+let refreshPromise = null;
+let refreshCallbacks = [];
+
 
 // Enhanced Clerk Authentication Hook with Token Refreshing
 export const useApiAuth = () => {
   const { getToken, isSignedIn } = useClerkAuth();
   
-  const registerAuthInterceptor = async () => {
+  // Function to refresh the token
+  const refreshToken = useCallback(async () => {
+    // If already refreshing, return the existing promise
+    if (isRefreshing) {
+      return refreshPromise;
+    }
+    
+    try {
+      isRefreshing = true;
+      refreshPromise = getToken({ expiration: 60 * 60 }); // 1 hour expiration
+      
+      const token = await refreshPromise;
+      
+      if (token) {
+        // Store token and calculate expiry time (with 5 min buffer)
+        authToken = token;
+        tokenExpiryTime = Date.now() + (55 * 60 * 1000); // 55 minutes in ms
+        console.log(`🔄 Token refreshed, valid for next 55 minutes`);
+        
+        // Call all queued callbacks with the new token
+        refreshCallbacks.forEach(callback => callback(token));
+        refreshCallbacks = [];
+      } else {
+        console.warn(`⚠️ No auth token available during refresh`);
+      }
+      
+      return token;
+    } catch (error) {
+      console.error('❌ Failed to refresh token:', error);
+      throw error;
+    } finally {
+      isRefreshing = false;
+      refreshPromise = null;
+    }
+  }, [getToken]);
+  
+  const registerAuthInterceptor = useCallback(async () => {
     try {
       // If an interceptor was already registered, remove it to prevent duplicates
       if (requestInterceptorId !== null) {
@@ -31,7 +72,12 @@ export const useApiAuth = () => {
         requestInterceptorId = null;
       }
       
-      // Add a new interceptor with better token handling
+      if (responseInterceptorId !== null) {
+        api.interceptors.response.eject(responseInterceptorId);
+        responseInterceptorId = null;
+      }
+      
+      // Add a new request interceptor with better token handling
       requestInterceptorId = api.interceptors.request.use(async (config) => {
         try {
           // Check if we need a new token (if it's expired or not set)
@@ -40,7 +86,7 @@ export const useApiAuth = () => {
           
           if (!tokenIsValid) {
             // Get a fresh token with longer expiration
-            const token = await getToken({ expiration: 60 * 60 }); // 1 hour expiration
+            const token = await refreshToken();
             
             if (token) {
               // Store token and calculate expiry time (with 5 min buffer)
@@ -62,15 +108,63 @@ export const useApiAuth = () => {
         return config;
       });
       
+      // Add a response interceptor to handle token expiration
+      responseInterceptorId = api.interceptors.response.use(
+        response => {
+          // Check for token expiration warning headers
+          if (response.headers['x-token-expiring-soon'] === 'true') {
+            console.log('⚠️ Token is expiring soon, refreshing...');
+            refreshToken();
+          }
+          return response;
+        },
+        async error => {
+          const originalRequest = error.config;
+          
+          // Only handle 401 errors for non-refresh requests
+          if (error.response?.status === 401 && 
+              error.response?.data?.tokenExpired && 
+              !originalRequest._retry) {
+            
+            // Mark this request as retried
+            originalRequest._retry = true;
+            
+            try {
+              // If we're already refreshing, wait for that to complete
+              let token;
+              if (isRefreshing) {
+                token = await new Promise((resolve) => {
+                  refreshCallbacks.push(resolve);
+                });
+              } else {
+                token = await refreshToken();
+              }
+              
+              // Retry the original request with the new token
+              if (token) {
+                originalRequest.headers['Authorization'] = `Bearer ${token}`;
+                return api(originalRequest);
+              }
+            } catch (refreshError) {
+              console.error('❌ Token refresh failed during response handling:', refreshError);
+            }
+          }
+          
+          return Promise.reject(error);
+        }
+      );
+      
       console.log('✅ Auth interceptor registered successfully');
       
       // Do an initial token fetch
       try {
-        const token = await getToken({ expiration: 60 * 60 }); // 1 hour expiration
-        if (token) {
-          authToken = token;
-          tokenExpiryTime = Date.now() + (55 * 60 * 1000); // 55 minutes
-          console.log('✅ Initial token fetched successfully');
+        if (!authToken) {
+          const token = await getToken({ expiration: 60 * 60 }); // 1 hour expiration
+          if (token) {
+            authToken = token;
+            tokenExpiryTime = Date.now() + (55 * 60 * 1000); // 55 minutes
+            console.log('✅ Initial token fetched successfully');
+          }
         }
       } catch (error) {
         console.error('❌ Failed to fetch initial token:', error);
@@ -78,7 +172,7 @@ export const useApiAuth = () => {
     } catch (error) {
       console.error("❌ Failed to register auth interceptor:", error);
     }
-  };
+  }, [refreshToken, getToken]);
   
   // Keep token refreshed in the background
   useEffect(() => {
@@ -89,12 +183,7 @@ export const useApiAuth = () => {
       // Set up a background refresh every 50 minutes
       const refreshInterval = setInterval(async () => {
         try {
-          const token = await getToken({ expiration: 60 * 60 }); // 1 hour
-          if (token) {
-            authToken = token;
-            tokenExpiryTime = Date.now() + (55 * 60 * 1000);
-            console.log('🔄 Background token refresh successful');
-          }
+          await refreshToken();
         } catch (error) {
           console.error('❌ Background token refresh failed:', error);
         }
@@ -107,49 +196,107 @@ export const useApiAuth = () => {
           api.interceptors.request.eject(requestInterceptorId);
           requestInterceptorId = null;
         }
+        if (responseInterceptorId !== null) {
+          api.interceptors.response.eject(responseInterceptorId);
+          responseInterceptorId = null;
+        }
       };
     }
-  }, [isSignedIn]);
-
+  }, [isSignedIn, registerAuthInterceptor, refreshToken]);
+  
   return { 
-    registerAuthInterceptor
+    registerAuthInterceptor,
+    refreshToken
   };
 };
 
-// Enhanced Balance Service with better error handling
+// Enhanced Balance Service with better error handling and token expiration handling
 export const balanceService = {
+  // Store last valid balance for fallback
+  _lastValidBalance: null,
+  _lastFetchTime: null,
+  
   getBalance: async () => {
     try {
       console.log("🔄 Fetching user balance...");
+      
+      // Check if we've fetched balance recently (within 10 seconds) and have a valid record
+      const now = Date.now();
+      if (balanceService._lastValidBalance && 
+          balanceService._lastFetchTime && 
+          (now - balanceService._lastFetchTime < 10000)) {
+        console.log("📦 Using cached balance from recent fetch");
+        return balanceService._lastValidBalance;
+      }
       
       // First try the authenticated endpoint
       try {
         const response = await api.get('/balance/me/balance');
         console.log("✅ Balance fetched successfully:", response.data);
+        
+        // Update cache
+        balanceService._lastValidBalance = response.data;
+        balanceService._lastFetchTime = now;
+        
         return response.data;
       } catch (error) {
         // If we get an authentication error, try the debug endpoint
         if (error.response && (error.response.status === 401 || error.response.status === 403)) {
           console.warn('⚠️ Authentication failed, trying debug endpoint');
           
-          // Try the debug endpoint which has more verbose logging
-          const debugResponse = await api.get('/balance/debug/balance');
-          console.log('Debug balance response:', debugResponse.data);
+          // Check if the error indicates token expiration
+          if (error.response.headers['x-token-expired'] === 'true' || 
+              error.response.data?.tokenExpired === true) {
+            console.warn('⚠️ Token expired, fall back to cache if available');
+            // If we have a valid cached balance, use it while token refreshes in background
+            if (balanceService._lastValidBalance) {
+              return {
+                ...balanceService._lastValidBalance,
+                isFromCache: true
+              };
+            }
+          }
           
-          // If debug endpoint successfully authenticated, return that data
-          if (debugResponse.data.authenticated && debugResponse.data.userId !== 'anonymous') {
-            return {
-              userId: debugResponse.data.userId,
-              pagesBalance: debugResponse.data.pagesBalance,
-              pagesUsed: debugResponse.data.pagesUsed,
-              lastUsed: debugResponse.data.lastUsed
-            };
+          // Try the debug endpoint which has more verbose logging
+          try {
+            const debugResponse = await api.get('/balance/debug/balance');
+            console.log('Debug balance response:', debugResponse.data);
+            
+            // If debug endpoint successfully authenticated, return that data
+            if (debugResponse.data.authenticated && debugResponse.data.userId !== 'anonymous') {
+              const balance = {
+                userId: debugResponse.data.userId,
+                pagesBalance: debugResponse.data.pagesBalance,
+                pagesUsed: debugResponse.data.pagesUsed,
+                lastUsed: debugResponse.data.lastUsed
+              };
+              
+              // Update cache
+              balanceService._lastValidBalance = balance;
+              balanceService._lastFetchTime = now;
+              
+              return balance;
+            }
+          } catch (debugError) {
+            console.warn('Debug endpoint failed:', debugError);
           }
           
           // Otherwise, fall back to the public endpoint
           console.warn('⚠️ Debug endpoint not authenticated, using public balance endpoint');
-          const publicResponse = await api.get('/balance/public/balance');
-          return publicResponse.data;
+          try {
+            const publicResponse = await api.get('/balance/public/balance');
+            
+            // Don't cache anonymous/public balance
+            if (publicResponse.data.userId !== 'anonymous') {
+              balanceService._lastValidBalance = publicResponse.data;
+              balanceService._lastFetchTime = now;
+            }
+            
+            return publicResponse.data;
+          } catch (publicError) {
+            console.warn('Public endpoint failed:', publicError);
+            throw publicError;
+          }
         }
         
         // If it's not an auth error, rethrow it
@@ -157,21 +304,41 @@ export const balanceService = {
       }
     } catch (error) {
       console.error('❌ Failed to fetch balance:', error);
+      
+      // Return a cached balance if available, otherwise use default
+      if (balanceService._lastValidBalance) {
+        console.log('📦 Using cached balance after error');
+        return {
+          ...balanceService._lastValidBalance,
+          isFromCache: true
+        };
+      }
+      
       // Return a default balance instead of throwing to maintain UI functionality
       return {
         userId: 'anonymous',
         pagesBalance: 10,
         pagesUsed: 0,
-        lastUsed: null
+        lastUsed: null,
+        isDefault: true
       };
     }
   },
-
+  
   addPages: async (pages) => {
     console.log(`🔄 Adding ${pages} pages to balance...`);
     try {
       const response = await api.post('/balance/add-pages', { pages });
       console.log('✅ Pages added successfully:', response.data);
+      
+      // Update cache to reflect new balance
+      if (response.data.success && response.data.newBalance) {
+        if (balanceService._lastValidBalance) {
+          balanceService._lastValidBalance.pagesBalance = response.data.newBalance;
+          balanceService._lastFetchTime = Date.now();
+        }
+      }
+      
       return response.data;
     } catch (error) {
       console.error('❌ Failed to add pages:', error);
@@ -192,6 +359,13 @@ export const balanceService = {
       console.error('❌ Failed to create payment:', error);
       throw error.response?.data?.error || 'Failed to process payment.';
     }
+  },
+  
+  // Method to manually invalidate cache
+  invalidateCache: () => {
+    balanceService._lastValidBalance = null;
+    balanceService._lastFetchTime = null;
+    console.log('📦 Balance cache invalidated');
   }
 };
 

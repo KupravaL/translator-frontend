@@ -11,7 +11,7 @@ import GoogleDriveButton from '../components/GoogleDriveButton';
 
 export default function DocumentTranslationPage() {
   const { user, isLoaded } = useUser();
-  const { registerAuthInterceptor } = useApiAuth();
+  const { registerAuthInterceptor, refreshToken } = useApiAuth(); // Updated to include refreshToken
   const contentRef = useRef(null);
   const statusCheckTimeoutRef = useRef(null);
   const pollAttemptRef = useRef(0);
@@ -57,6 +57,17 @@ export default function DocumentTranslationPage() {
 
   const [isCopied, setIsCopied] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState('en');
+
+  const ensureValidToken = useCallback(async () => {
+    try {
+      await refreshToken();
+      // Invalidate balance cache to get fresh data after token refresh
+      balanceService.invalidateCache();
+    } catch (error) {
+      console.error('Failed to refresh token:', error);
+      // Continue anyway - the interceptors will handle auth errors
+    }
+  }, [refreshToken]);
 
   // Register auth interceptor on mount
   useEffect(() => {
@@ -367,6 +378,9 @@ export default function DocumentTranslationPage() {
       return;
     }
 
+    // Ensure token is valid before starting translation
+    await ensureValidToken();
+
     setSelectedLanguage(toLang);
     
     // Store file info for potential recovery
@@ -661,6 +675,11 @@ export default function DocumentTranslationPage() {
   // Improved fetchTranslationResults function with partial result handling
   const fetchTranslationResults = async (processId) => {
     try {
+      // Ensure token is valid before fetching results
+      if (translationStatus.status === 'completed') {
+        await ensureValidToken();
+      }
+      
       // First try with normal request
       const resultResponse = await documentService.getTranslationResult(processId);
       
