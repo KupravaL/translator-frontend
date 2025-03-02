@@ -123,8 +123,6 @@ const logTokenInfo = (token, source = "unknown") => {
   };
 };
 
-
-
 // Enhanced Clerk Authentication Hook with Token Refreshing
 export const useApiAuth = () => {
   const { getToken, isSignedIn } = useClerkAuth();
@@ -171,6 +169,45 @@ export const useApiAuth = () => {
     } finally {
       isRefreshing = false;
       refreshPromise = null;
+    }
+  }, [getToken]);
+  
+  // Function to get token diagnostics for debugging
+  const getTokenDiagnostics = useCallback(async () => {
+    try {
+      // Get current token
+      const token = authToken || await getToken({ expiration: 60 * 60 });
+      if (!token) {
+        return { error: 'No token available' };
+      }
+      
+      // Decode and log token info
+      const tokenInfo = logTokenInfo(token, "diagnostic");
+      
+      // Get token history from localStorage
+      let history = [];
+      try {
+        history = JSON.parse(localStorage.getItem('tokenHistory') || '[]');
+      } catch (e) {
+        console.warn('Failed to parse token history:', e);
+      }
+      
+      return {
+        currentToken: {
+          issuedAt: new Date(tokenInfo.issuedAt * 1000).toISOString(),
+          expiresAt: new Date(tokenInfo.expiresAt * 1000).toISOString(),
+          lifespanMinutes: Math.floor(tokenInfo.lifespan / 60),
+          remainingMinutes: Math.floor(tokenInfo.remaining / 60)
+        },
+        history: history,
+        tokenState: {
+          isRefreshing,
+          callbacksWaiting: refreshCallbacks.length
+        }
+      };
+    } catch (error) {
+      console.error('Error getting token diagnostics:', error);
+      return { error: String(error) };
     }
   }, [getToken]);
   
@@ -295,121 +332,76 @@ export const useApiAuth = () => {
   }, [refreshToken, getToken]);
   
   // Keep token refreshed in the background
- // Keep token refreshed in the background
- useEffect(() => {
-  if (isSignedIn) {
-    // Register the interceptor first
-    registerAuthInterceptor();
-    
-    // Set up a background refresh at 3/4 of token lifespan
-    const setupRefreshInterval = async () => {
-      try {
-        // Get initial token to determine lifespan
-        const token = await getToken({ expiration: 60 * 60 });
-        if (token) {
-          const tokenInfo = logTokenInfo(token, "interval-setup");
-          if (tokenInfo && tokenInfo.lifespan) {
-            // Calculate refresh interval at 3/4 of token lifespan
-            const refreshInterval = Math.floor(tokenInfo.lifespan * 0.75) * 1000;
-            console.log(`🔄 Setting up background refresh every ${Math.floor(refreshInterval/60000)} minutes`);
-            
-            const intervalId = setInterval(async () => {
-              try {
-                await refreshToken();
-              } catch (error) {
-                console.error('❌ Background token refresh failed:', error);
-              }
-            }, refreshInterval);
-            
-            return () => clearInterval(intervalId);
-          }
-        }
-      } catch (error) {
-        console.error('Failed to set up token refresh interval:', error);
-      }
+  useEffect(() => {
+    if (isSignedIn) {
+      // Register the interceptor first
+      registerAuthInterceptor();
       
-      // Fallback to default 45 minute interval if we couldn't determine token lifespan
-      const intervalId = setInterval(async () => {
+      // We'll declare a variable to store the interval ID
+      let intervalId = null;
+      
+      // Set up background refresh
+      const setupInterval = async () => {
         try {
-          await refreshToken();
+          // Get initial token to determine lifespan
+          const token = await getToken({ expiration: 60 * 60 });
+          if (token) {
+            const tokenInfo = logTokenInfo(token, "interval-setup");
+            if (tokenInfo && tokenInfo.lifespan) {
+              // Calculate refresh interval at 3/4 of token lifespan
+              const refreshInterval = Math.floor(tokenInfo.lifespan * 0.75) * 1000;
+              console.log(`🔄 Setting up background refresh every ${Math.floor(refreshInterval/60000)} minutes`);
+              
+              intervalId = setInterval(async () => {
+                try {
+                  await refreshToken();
+                } catch (error) {
+                  console.error('❌ Background token refresh failed:', error);
+                }
+              }, refreshInterval);
+            }
+          }
         } catch (error) {
-          console.error('❌ Background token refresh failed:', error);
+          console.error('Failed to set up token refresh interval:', error);
+          
+          // Fallback to default 45 minute interval if we couldn't determine token lifespan
+          intervalId = setInterval(async () => {
+            try {
+              await refreshToken();
+            } catch (error) {
+              console.error('❌ Background token refresh failed:', error);
+            }
+          }, 45 * 60 * 1000); // 45 minutes
         }
-      }, 45 * 60 * 1000); // 45 minutes
+      };
       
-      return () => clearInterval(intervalId);
-    };
-    
-    // Set up the interval and store the cleanup function
-    const cleanupIntervalFn = setupRefreshInterval();
-    
-    // Return a cleanup function that will call the interval cleanup when the component unmounts
-    return () => {
-      cleanupIntervalFn.then(cleanupFn => cleanupFn());
+      // Call the setup function
+      setupInterval();
       
-      if (requestInterceptorId !== null) {
-        api.interceptors.request.eject(requestInterceptorId);
-        requestInterceptorId = null;
-      }
-      if (responseInterceptorId !== null) {
-        api.interceptors.response.eject(responseInterceptorId);
-        responseInterceptorId = null;
-      }
-    };
-  }
-}, [isSignedIn, registerAuthInterceptor, refreshToken, getToken]);
+      // Return the cleanup function directly
+      return () => {
+        if (intervalId) {
+          clearInterval(intervalId);
+        }
+        
+        if (requestInterceptorId !== null) {
+          api.interceptors.request.eject(requestInterceptorId);
+          requestInterceptorId = null;
+        }
+        if (responseInterceptorId !== null) {
+          api.interceptors.response.eject(responseInterceptorId);
+          responseInterceptorId = null;
+        }
+      };
+    }
+  }, [isSignedIn, registerAuthInterceptor, refreshToken, getToken]);
   
   return { 
     registerAuthInterceptor,
-    refreshToken
+    refreshToken,
+    getTokenDiagnostics
   };
 };
-
-// Add a function to get token diagnostics for debugging
-const getTokenDiagnostics = useCallback(async () => {
-  try {
-    // Get current token
-    const token = authToken || await getToken({ expiration: 60 * 60 });
-    if (!token) {
-      return { error: 'No token available' };
-    }
-    
-    // Decode and log token info
-    const tokenInfo = logTokenInfo(token, "diagnostic");
-    
-    // Get token history from localStorage
-    let history = [];
-    try {
-      history = JSON.parse(localStorage.getItem('tokenHistory') || '[]');
-    } catch (e) {
-      console.warn('Failed to parse token history:', e);
-    }
-    
-    return {
-      currentToken: {
-        issuedAt: new Date(tokenInfo.issuedAt * 1000).toISOString(),
-        expiresAt: new Date(tokenInfo.expiresAt * 1000).toISOString(),
-        lifespanMinutes: Math.floor(tokenInfo.lifespan / 60),
-        remainingMinutes: Math.floor(tokenInfo.remaining / 60)
-      },
-      history: history,
-      tokenState: {
-        isRefreshing,
-        callbacksWaiting: refreshCallbacks.length
-      }
-    };
-  } catch (error) {
-    console.error('Error getting token diagnostics:', error);
-    return { error: String(error) };
-  }
-}, [getToken]);
-
-return { 
-  registerAuthInterceptor,
-  refreshToken,
-  getTokenDiagnostics
-};
-
 
 // Enhanced Balance Service with better error handling and token expiration handling
 export const balanceService = {
@@ -772,96 +764,6 @@ export const documentService = {
     }
   },
   
-  getTranslationResult: async (processId) => {
-    // Deduplicate concurrent result fetches for the same processId
-    const requestKey = `result-${processId}`;
-    
-    // If there's already an active request for this processId, return its promise
-    if (documentService._activeRequests.has(requestKey)) {
-      console.log(`⏳ [${new Date().toISOString()}] Reusing existing result fetch for process: ${processId}`);
-      return documentService._activeRequests.get(requestKey);
-    }
-    
-    // Create an AbortController for timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15-second timeout for results
-    
-    const startTime = Date.now();
-    console.log(`🔄 [${new Date().toISOString()}] Fetching translation result for process: ${processId}`);
-    
-    // Create the promise for this request
-    const requestPromise = (async () => {
-      try {
-        const response = await api.get(`/documents/result/${processId}`, {
-          signal: controller.signal,
-          timeout: 15000
-        });
-        
-        // Clear timeout
-        clearTimeout(timeoutId);
-        
-        const duration = Date.now() - startTime;
-        console.log(`✅ [${new Date().toISOString()}] Translation result fetched successfully in ${duration}ms, content length: ${response.data.translatedText?.length || 0} chars`);
-        
-        // Update status to completed in our cache
-        documentService._updateLastKnownStatus(processId, {
-          processId: processId,
-          status: 'completed',
-          progress: 100,
-          currentPage: response.data.metadata?.currentPage || 0,
-          totalPages: response.data.metadata?.totalPages || 0
-        });
-        
-        return response.data;
-      } catch (error) {
-        // Clear timeout
-        clearTimeout(timeoutId);
-        
-        const duration = Date.now() - startTime;
-        console.error(`❌ [${new Date().toISOString()}] Result fetch failed after ${duration}ms:`, error);
-        
-        // Handle timeouts
-        if (
-          error.name === 'AbortError' || 
-          error.code === 'ECONNABORTED' || 
-          error.message.includes('timeout')
-        ) {
-          throw new Error('Request timed out while fetching translation results. The server might be busy processing a large document. Please try again in a moment.');
-        }
-        
-        // Handle authentication errors
-        if (error.response && error.response.status === 401) {
-          try {
-            return await documentService._handleAuthError(
-              error, 
-              'result', 
-              () => api.get(`/documents/result/${processId}`)
-            ).then(response => response.data);
-          } catch (retryError) {
-            // If retry fails, continue with normal error handling
-          }
-        }
-        
-        // Enhanced error handling with specific error messages
-        if (error.response?.status === 404) {
-          throw new Error('Translation not found. The process may have expired.');
-        } else if (error.response?.status === 400) {
-          throw new Error('Translation is not yet complete. Please wait until it finishes processing.');
-        }
-        
-        throw new Error('Failed to fetch translation result. Please try again later.');
-      } finally {
-        // Remove this request from the active requests map
-        documentService._activeRequests.delete(requestKey);
-      }
-    })();
-    
-    // Store the promise in the active requests map
-    documentService._activeRequests.set(requestKey, requestPromise);
-    
-    return requestPromise;
-  },
-
   exportToPdf: async (text, fileName) => {
     console.log(`🔄 Exporting document to PDF: ${fileName}...`);
     try {
