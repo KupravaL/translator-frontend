@@ -17,11 +17,112 @@ const api = axios.create({
 // Store the token and interceptor ID for non-hook contexts
 let authToken = null;
 let tokenExpiryTime = null;
+let tokenIssuedAt = null;
+let tokenLifespan = null;
 let requestInterceptorId = null;
 let responseInterceptorId = null;
 let isRefreshing = false;
 let refreshPromise = null;
 let refreshCallbacks = [];
+
+// Function to decode a JWT token without verifying signature
+const decodeToken = (token) => {
+  try {
+    // Extract the payload part (second segment) of the JWT
+    const payload = token.split('.')[1];
+    // Decode base64url-encoded payload
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+      return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+    }).join(''));
+    
+    return JSON.parse(jsonPayload);
+  } catch (error) {
+    console.error('Error decoding token:', error);
+    return null;
+  }
+};
+
+// Function to log token information
+const logTokenInfo = (token, source = "unknown") => {
+  const decodedToken = decodeToken(token);
+  if (!decodedToken) {
+    console.error('Failed to decode token');
+    return;
+  }
+  
+  const now = Math.floor(Date.now() / 1000);
+  const exp = decodedToken.exp;
+  const iat = decodedToken.iat;
+  
+  if (!exp || !iat) {
+    console.error('Token missing expiration or issued-at claims');
+    return;
+  }
+  
+  // Calculate token lifespan and remaining time
+  const lifespan = exp - iat;
+  const lifespanMinutes = Math.floor(lifespan / 60);
+  
+  const remaining = exp - now;
+  const remainingMinutes = Math.floor(remaining / 60);
+  const remainingSeconds = remaining % 60;
+  
+  // Format dates for logging
+  const issuedDate = new Date(iat * 1000).toISOString();
+  const expiryDate = new Date(exp * 1000).toISOString();
+  
+  // Save token info in global variables
+  tokenIssuedAt = iat;
+  tokenExpiryTime = exp;
+  tokenLifespan = lifespan;
+  
+  // Create detailed log message
+  const logMessage = `
+🔐 TOKEN INFO (${source}):
+  Issued at: ${issuedDate}
+  Expires at: ${expiryDate}
+  Total lifespan: ${lifespanMinutes} minutes (${lifespan} seconds)
+  Remaining time: ${remainingMinutes}m ${remainingSeconds}s
+  Subject: ${decodedToken.sub || 'N/A'}
+  Issuer: ${decodedToken.iss || 'N/A'}
+  Audience: ${decodedToken.aud || 'N/A'}
+  `;
+  
+  // Log token info to console
+  console.log(logMessage);
+  
+  // Store token diagnostic info in localStorage for debugging
+  try {
+    const tokenHistory = JSON.parse(localStorage.getItem('tokenHistory') || '[]');
+    tokenHistory.push({
+      timestamp: Date.now(),
+      source,
+      issuedAt: iat,
+      expiresAt: exp,
+      lifespan,
+      remaining,
+      sub: decodedToken.sub
+    });
+    
+    // Keep only the last 10 entries
+    while (tokenHistory.length > 10) {
+      tokenHistory.shift();
+    }
+    
+    localStorage.setItem('tokenHistory', JSON.stringify(tokenHistory));
+  } catch (e) {
+    console.warn('Failed to store token history:', e);
+  }
+  
+  return {
+    issuedAt: iat,
+    expiresAt: exp,
+    lifespan,
+    remaining
+  };
+};
+
 
 
 // Enhanced Clerk Authentication Hook with Token Refreshing
@@ -37,15 +138,24 @@ export const useApiAuth = () => {
     
     try {
       isRefreshing = true;
-      refreshPromise = getToken({ expiration: 60 * 60 }); // 1 hour expiration
+      console.log('🔄 Refreshing authentication token...');
+      
+      // Request a token with explicit expiration (1 hour)
+      refreshPromise = getToken({ expiration: 60 * 60 }); 
       
       const token = await refreshPromise;
       
       if (token) {
+        // Log detailed token information
+        const tokenInfo = logTokenInfo(token, "refresh");
+        
         // Store token and calculate expiry time (with 5 min buffer)
         authToken = token;
-        tokenExpiryTime = Date.now() + (55 * 60 * 1000); // 55 minutes in ms
-        console.log(`🔄 Token refreshed, valid for next 55 minutes`);
+        if (tokenInfo) {
+          tokenExpiryTime = Date.now() + ((tokenInfo.remaining - 300) * 1000); // 5 minute buffer
+        }
+        
+        console.log(`🔄 Token refreshed, valid for next ${Math.floor((tokenExpiryTime - Date.now()) / 60000)} minutes`);
         
         // Call all queued callbacks with the new token
         refreshCallbacks.forEach(callback => callback(token));
@@ -89,12 +199,17 @@ export const useApiAuth = () => {
             const token = await refreshToken();
             
             if (token) {
-              // Store token and calculate expiry time (with 5 min buffer)
-              authToken = token;
-              tokenExpiryTime = now + (55 * 60 * 1000); // 55 minutes in ms
-              console.log(`🔄 Token refreshed, valid for next 55 minutes`);
+              // Token is set in refreshToken
+              console.log(`🔑 New token applied to request: ${config.url}`);
             } else {
-              console.warn(`⚠️ No auth token available`);
+              console.warn(`⚠️ No auth token available for request: ${config.url}`);
+            }
+          } else {
+            // If token is valid but getting close to expiry (within 10 minutes), refresh in background
+            if (tokenExpiryTime && (tokenExpiryTime - now < 10 * 60 * 1000)) {
+              console.log(`🔄 Token expiring soon (${Math.floor((tokenExpiryTime - now) / 60000)}m remaining), refreshing in background`);
+              // Don't await - refresh in background
+              refreshToken().catch(e => console.warn('Background token refresh failed:', e));
             }
           }
           
@@ -159,10 +274,15 @@ export const useApiAuth = () => {
       // Do an initial token fetch
       try {
         if (!authToken) {
-          const token = await getToken({ expiration: 60 * 60 }); // 1 hour expiration
+          console.log('🔍 Fetching initial token...');
+          // Request a token with explicit expiration (1 hour)
+          const token = await getToken({ expiration: 60 * 60 });
+          
           if (token) {
+            // Log and store token info
+            logTokenInfo(token, "initial");
             authToken = token;
-            tokenExpiryTime = Date.now() + (55 * 60 * 1000); // 55 minutes
+            
             console.log('✅ Initial token fetched successfully');
           }
         }
@@ -175,40 +295,121 @@ export const useApiAuth = () => {
   }, [refreshToken, getToken]);
   
   // Keep token refreshed in the background
-  useEffect(() => {
-    if (isSignedIn) {
-      // Register the interceptor first
-      registerAuthInterceptor();
+ // Keep token refreshed in the background
+ useEffect(() => {
+  if (isSignedIn) {
+    // Register the interceptor first
+    registerAuthInterceptor();
+    
+    // Set up a background refresh at 3/4 of token lifespan
+    const setupRefreshInterval = async () => {
+      try {
+        // Get initial token to determine lifespan
+        const token = await getToken({ expiration: 60 * 60 });
+        if (token) {
+          const tokenInfo = logTokenInfo(token, "interval-setup");
+          if (tokenInfo && tokenInfo.lifespan) {
+            // Calculate refresh interval at 3/4 of token lifespan
+            const refreshInterval = Math.floor(tokenInfo.lifespan * 0.75) * 1000;
+            console.log(`🔄 Setting up background refresh every ${Math.floor(refreshInterval/60000)} minutes`);
+            
+            const intervalId = setInterval(async () => {
+              try {
+                await refreshToken();
+              } catch (error) {
+                console.error('❌ Background token refresh failed:', error);
+              }
+            }, refreshInterval);
+            
+            return () => clearInterval(intervalId);
+          }
+        }
+      } catch (error) {
+        console.error('Failed to set up token refresh interval:', error);
+      }
       
-      // Set up a background refresh every 50 minutes
-      const refreshInterval = setInterval(async () => {
+      // Fallback to default 45 minute interval if we couldn't determine token lifespan
+      const intervalId = setInterval(async () => {
         try {
           await refreshToken();
         } catch (error) {
           console.error('❌ Background token refresh failed:', error);
         }
-      }, 50 * 60 * 1000); // 50 minutes
+      }, 45 * 60 * 1000); // 45 minutes
       
-      // Clean up interval
-      return () => {
-        clearInterval(refreshInterval);
-        if (requestInterceptorId !== null) {
-          api.interceptors.request.eject(requestInterceptorId);
-          requestInterceptorId = null;
-        }
-        if (responseInterceptorId !== null) {
-          api.interceptors.response.eject(responseInterceptorId);
-          responseInterceptorId = null;
-        }
-      };
-    }
-  }, [isSignedIn, registerAuthInterceptor, refreshToken]);
+      return () => clearInterval(intervalId);
+    };
+    
+    // Set up the interval and store the cleanup function
+    const cleanupIntervalFn = setupRefreshInterval();
+    
+    // Return a cleanup function that will call the interval cleanup when the component unmounts
+    return () => {
+      cleanupIntervalFn.then(cleanupFn => cleanupFn());
+      
+      if (requestInterceptorId !== null) {
+        api.interceptors.request.eject(requestInterceptorId);
+        requestInterceptorId = null;
+      }
+      if (responseInterceptorId !== null) {
+        api.interceptors.response.eject(responseInterceptorId);
+        responseInterceptorId = null;
+      }
+    };
+  }
+}, [isSignedIn, registerAuthInterceptor, refreshToken, getToken]);
   
   return { 
     registerAuthInterceptor,
     refreshToken
   };
 };
+
+// Add a function to get token diagnostics for debugging
+const getTokenDiagnostics = useCallback(async () => {
+  try {
+    // Get current token
+    const token = authToken || await getToken({ expiration: 60 * 60 });
+    if (!token) {
+      return { error: 'No token available' };
+    }
+    
+    // Decode and log token info
+    const tokenInfo = logTokenInfo(token, "diagnostic");
+    
+    // Get token history from localStorage
+    let history = [];
+    try {
+      history = JSON.parse(localStorage.getItem('tokenHistory') || '[]');
+    } catch (e) {
+      console.warn('Failed to parse token history:', e);
+    }
+    
+    return {
+      currentToken: {
+        issuedAt: new Date(tokenInfo.issuedAt * 1000).toISOString(),
+        expiresAt: new Date(tokenInfo.expiresAt * 1000).toISOString(),
+        lifespanMinutes: Math.floor(tokenInfo.lifespan / 60),
+        remainingMinutes: Math.floor(tokenInfo.remaining / 60)
+      },
+      history: history,
+      tokenState: {
+        isRefreshing,
+        callbacksWaiting: refreshCallbacks.length
+      }
+    };
+  } catch (error) {
+    console.error('Error getting token diagnostics:', error);
+    return { error: String(error) };
+  }
+}, [getToken]);
+
+return { 
+  registerAuthInterceptor,
+  refreshToken,
+  getTokenDiagnostics
+};
+
 
 // Enhanced Balance Service with better error handling and token expiration handling
 export const balanceService = {
@@ -843,6 +1044,18 @@ export const documentService = {
     documentService._activeRequests.set(requestKey, requestPromise);
     
     return requestPromise;
+  }
+};
+
+// Add a global function for checking token info from browser console
+window.checkTokenInfo = async () => {
+  try {
+    // Get token from Clerk
+    const token = await window.Clerk.session.getToken({ expiration: 60 * 60 });
+    return logTokenInfo(token, "manual-check");
+  } catch (error) {
+    console.error('Error checking token info:', error);
+    return { error: String(error) };
   }
 };
 
