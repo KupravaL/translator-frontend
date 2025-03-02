@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { CreditCard, RefreshCw } from 'lucide-react';
+import { CreditCard, RefreshCw, Plus, ShoppingCart } from 'lucide-react';
 import { balanceService } from '../services/api';
 import { toast } from 'sonner';
+import PurchasePages from './PurchasePages';
+import AddPages from './AddPages';
 
 export default function BalanceDisplay() {
   const [balance, setBalance] = useState({
@@ -73,6 +75,15 @@ export default function BalanceDisplay() {
     fetchBalance(true);
   };
 
+  // Handle balance update after purchase or add pages
+  const handleBalanceUpdate = () => {
+    // Short delay to allow backend to update
+    setTimeout(() => {
+      balanceService.invalidateCache();
+      fetchBalance(true);
+    }, 500);
+  };
+
   return (
     <div className="bg-white rounded-xl shadow-md overflow-hidden mb-8 border border-gray-100">
       <div className="bg-gray-50 px-6 py-4 flex justify-between items-center">
@@ -80,14 +91,16 @@ export default function BalanceDisplay() {
           <CreditCard className="h-5 w-5 text-indigo-600 mr-2" />
           <h3 className="text-lg font-medium text-gray-800">Pages Balance</h3>
         </div>
-        <button
-          onClick={handleManualRefresh}
-          disabled={isRefreshing}
-          className="p-1.5 rounded-md text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 transition-colors disabled:opacity-50"
-          title="Refresh balance"
-        >
-          <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleManualRefresh}
+            disabled={isRefreshing}
+            className="p-1.5 rounded-md text-gray-500 hover:text-indigo-600 hover:bg-indigo-50 transition-colors disabled:opacity-50"
+            title="Refresh balance"
+          >
+            <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
       </div>
       <div className="px-6 py-4">
         {balance.isLoading ? (
@@ -107,14 +120,30 @@ export default function BalanceDisplay() {
           </div>
         ) : (
           <div>
-            <div className="flex justify-between items-center mb-2">
-              <span className="text-gray-600">Available Pages:</span>
-              <span className="font-semibold text-indigo-700 text-lg">{balance.pagesBalance}</span>
+            <div className="flex justify-between items-center mb-4">
+              <div>
+                <div className="flex items-center mb-1">
+                  <span className="text-gray-600">Available Pages:</span>
+                  <span className="font-semibold text-indigo-700 text-lg ml-2">{balance.pagesBalance}</span>
+                </div>
+                <div className="flex items-center text-sm">
+                  <span className="text-gray-500">Pages Used:</span>
+                  <span className="text-gray-700 ml-2">{balance.pagesUsed}</span>
+                </div>
+              </div>
+              
+              <div className="flex gap-2">
+                <AddPages 
+                  onSuccess={handleBalanceUpdate} 
+                  className="text-sm px-3 py-1.5"
+                />
+                <PurchasePages 
+                  onSuccess={handleBalanceUpdate}
+                  className="text-sm px-3 py-1.5"
+                />
+              </div>
             </div>
-            <div className="flex justify-between items-center text-sm">
-              <span className="text-gray-500">Pages Used:</span>
-              <span className="text-gray-700">{balance.pagesUsed}</span>
-            </div>
+            
             {balance.isFromCache && (
               <div className="mt-2 text-amber-600 text-xs flex items-center">
                 <span>Using cached balance data</span>

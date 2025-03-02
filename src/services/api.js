@@ -518,10 +518,30 @@ export const balanceService = {
     }
   },
   
-  addPages: async (pages) => {
+  purchasePages: async (pages, email) => {
+    console.log(`🔄 Creating payment for ${pages} pages...`);
+    try {
+      const response = await api.post('/balance/purchase/pages', { 
+        pages, 
+        email 
+      });
+      console.log('✅ Payment created successfully:', response.data);
+      return response.data;
+    } catch (error) {
+      console.error('❌ Failed to create payment:', error);
+      throw error.response?.data?.error || 'Failed to process payment.';
+    }
+  },
+  
+  addPages: async (pages, paymentId = null) => {
     console.log(`🔄 Adding ${pages} pages to balance...`);
     try {
-      const response = await api.post('/balance/add-pages', { pages });
+      const payload = { pages };
+      if (paymentId) {
+        payload.paymentId = paymentId;
+      }
+      
+      const response = await api.post('/balance/add-pages', payload);
       console.log('✅ Pages added successfully:', response.data);
       
       // Update cache to reflect new balance
@@ -535,22 +555,7 @@ export const balanceService = {
       return response.data;
     } catch (error) {
       console.error('❌ Failed to add pages:', error);
-      throw error.response?.data?.error || 'Failed to add translation pages.';
-    }
-  },
-  
-  purchasePages: async (pages, email) => {
-    console.log(`🔄 Creating payment for ${pages} pages...`);
-    try {
-      const response = await api.post('/balance/purchase/pages', { 
-        pages, 
-        email 
-      });
-      console.log('✅ Payment created successfully:', response.data);
-      return response.data;
-    } catch (error) {
-      console.error('❌ Failed to create payment:', error);
-      throw error.response?.data?.error || 'Failed to process payment.';
+      throw error.response?.data?.error || 'Failed to add pages to your balance.';
     }
   },
   
