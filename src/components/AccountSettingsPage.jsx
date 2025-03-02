@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { UserProfile, useUser } from '@clerk/clerk-react';
-import TokenDebugInfo from './TokenDebugInfo';
+import TokenDebugInfo from './TokenDebug';
 
 export default function AccountSettingsPage() {
   const { user, isLoaded } = useUser();
