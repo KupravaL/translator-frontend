@@ -24,7 +24,9 @@ const LANGUAGE_OPTIONS = [
   { value: 'ar', label: 'Arabic' },
   { value: 'hi', label: 'Hindi' },
   { value: 'fa', label: 'Persian' },
-  { value: 'ka', label: 'Georgian'}
+  { value: 'ka', label: 'Georgian'},
+  { value: 'az', label: 'Azerbaijani'},
+  { value: 'hy', label: 'Armenian'},
 ]
 
 export default function DocumentsUpload({ onTranslate, isLoading, onCancel }) {
